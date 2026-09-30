@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lithe"
+dynamic = ["version"]
+description = "A reusable, storage-free ReAct agent kernel (engine + framework + protocols) with optional capability bundles."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.24"]
+keywords = ["agent", "llm", "react", "kernel", "tool-calling", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
+
+# [project.urls]: left out until the project has a real repository/homepage —
+# placeholder links to a non-existent github org mislead more than they help.
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4"]
+
+[tool.setuptools.dynamic]
+# Single source of truth: the literal in lithe/__init__.py (setuptools
+# reads simple literals statically, without importing the package).
+version = { attr = "lithe.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["lithe*"]
+
+[tool.setuptools.package-data]
+lithe = ["py.typed"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "UP", "ASYNC"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
