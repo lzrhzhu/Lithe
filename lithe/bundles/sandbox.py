@@ -30,6 +30,16 @@ from lithe.tools import ToolCategory, ToolRegistry, ToolResult, ToolSpec
 # Parent-process vars safe to forward: pure runtime config, never secrets.
 _SAFE_ENV_NAMES = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM")
 
+# Windows runtime vars the child cannot start or work without: SYSTEMROOT is
+# required to initialize hash randomization (CryptoAPI lives under it) — a
+# Python started without it dies with "_Py_HashRandomization_Init" before
+# running any code. TEMP/TMP back tempfile, COMSPEC/PATHEXT back subprocess
+# spawning. None of these carry secrets.
+_WIN_SAFE_ENV_NAMES = (
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
+    "TEMP", "TMP", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+)
+
 
 def _sandbox_env() -> dict[str, str]:
     """Secret-free env for the child: a fixed allow-list forwarded from the
@@ -37,7 +47,8 @@ def _sandbox_env() -> dict[str, str]:
     so secrets (AUTH_SECRET / *_API_KEY / ...) can never reach executed code."""
     env = {"HOME": "/tmp", "MPLBACKEND": "Agg", "XDG_CACHE_HOME": "/tmp/.cache",
            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
-    for name in _SAFE_ENV_NAMES:
+    names = _SAFE_ENV_NAMES + (_WIN_SAFE_ENV_NAMES if os.name == "nt" else ())
+    for name in names:
         val = os.environ.get(name)
         if val:
             env[name] = val
@@ -59,6 +70,38 @@ async def _drain(proc) -> tuple[bytes, bytes]:
     except Exception:
         pass
     return out, err
+
+
+async def _kill_tree(proc) -> None:
+    """Kill the child and its subprocess tree. POSIX: the child started a new
+    session, so killpg takes spawned grandchildren too. Windows: no process
+    groups (and no os.killpg) — taskkill /T /F walks the tree instead."""
+    if os.name == "nt":
+        taskkill = shutil.which("taskkill")
+        if taskkill:
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    taskkill, "/PID", str(proc.pid), "/T", "/F",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(killer.wait(), timeout=3)
+            except (OSError, asyncio.TimeoutError):
+                pass
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
 
 
 class CodeRunner:
@@ -156,13 +199,7 @@ class CodeRunner:
                 proc.communicate(input=stdin_bytes), timeout=self.timeout)
         except asyncio.TimeoutError:
             timed_out = True
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+            await _kill_tree(proc)
             await proc.wait()
             # A grandchild that escaped the group kill can still hold the
             # pipe write end; bound the drain so the timeout actually ends
