@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.12 (2026-10-01)
+
+The Windows release: `run_code` works outside POSIX for the first time.
+
+- **sandbox env keeps Windows children alive** — the secret-free child
+  environment now forwards `SYSTEMROOT` (plus `SYSTEMDRIVE`, `WINDIR`,
+  `COMSPEC`, `PATHEXT`, `TEMP`/`TMP` and a few more runtime names) on
+  Windows. Without `SYSTEMROOT` a child Python aborts before running
+  any code with `Fatal Python error: _Py_HashRandomization_Init` (hash
+  seeding reaches for the CryptoAPI, which resolves through it). None
+  of the forwarded names can carry secrets, so the leak guarantee is
+  unchanged.
+- **timeout kills work on Windows** — the kill path used
+  `os.killpg`/`signal.SIGKILL`, neither of which exists there, so a
+  timed-out run raised `AttributeError` instead of killing. Killing now
+  branches per platform: POSIX keeps the process-group kill; Windows
+  walks the process tree with `taskkill /PID <pid> /T /F`, so spawned
+  grandchildren die with the child instead of surviving it.
+
 ## 0.9.11 (2026-09-30)
 
 The todo-restraint release: planning stays available but stops firing
