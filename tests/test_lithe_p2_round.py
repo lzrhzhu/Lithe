@@ -499,8 +499,18 @@ def test_stdio_spawn_env_allowlist(monkeypatch):
     monkeypatch.setenv("MY_API_KEY", "sk-leak")
     cfg = MCPServerConfig(name="s", command=["x"],
                           env={"TOOL_KEY": "tv"})
-    env = _StdioSession(cfg)._spawn_env()
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    for key, value in {
+        "SYSTEMROOT": r"C:\Windows",
+        "WINDIR": r"C:\Windows",
+        "TEMP": r"C:\Temp",
+        "COMSPEC": r"C:\Windows\System32\cmd.exe",
+    }.items():
+        monkeypatch.setenv(key, value)
+    env = _StdioSession(cfg)._spawn_env(windows=True)
     assert env["PATH"] == "/usr/bin" and env["TOOL_KEY"] == "tv"
+    assert env["SYSTEMROOT"] == r"C:\Windows"
+    assert env["WINDIR"] == r"C:\Windows"
     assert "AUTH_SECRET" not in env and "MY_API_KEY" not in env
 
     legacy = _StdioSession(
@@ -510,8 +520,13 @@ def test_stdio_spawn_env_allowlist(monkeypatch):
 
     closed = _StdioSession(
         MCPServerConfig(name="s", command=["x"], inherit_env=False)
-    )._spawn_env()
-    assert closed == {"TOOL_KEY": "tv"} or not closed
+    )._spawn_env(windows=True)
+    assert closed.get("TOOL_KEY") is None
+    assert set(closed).issubset({
+        "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE",
+        "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "OS", "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+    })
 
 
 def test_log_host_strips_credentials():

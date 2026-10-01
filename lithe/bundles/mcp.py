@@ -41,7 +41,9 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import signal
+import subprocess
 from collections import deque
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -61,6 +63,10 @@ _CLIENT_INFO = {"name": "lithe-mcp", "version": __version__}
 # the same allow-list policy the sandbox bundle uses. ``inherit_env=True``
 # forwards all of os.environ (legacy behavior); ``False`` forwards none.
 _SAFE_ENV_NAMES = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "HOME", "TMPDIR")
+_WINDOWS_SAFE_ENV_NAMES = (
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+    "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+)
 
 
 @dataclass
@@ -242,12 +248,17 @@ class _StdioSession:
 
     async def start(self) -> None:
         env = self._spawn_env()
+        process_options = (
+            {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+            if os.name == "nt"
+            else {"start_new_session": True}
+        )
         self.proc = await asyncio.create_subprocess_exec(
             *self.cfg.command, env=env, cwd=self.cfg.cwd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+            **process_options,
         )
         self._reader = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
@@ -267,17 +278,25 @@ class _StdioSession:
         log.info("MCP server %s started (pid %s, protocol %s)",
                  self.cfg.name, self.proc.pid, result.get("protocolVersion"))
 
-    def _spawn_env(self) -> dict[str, str]:
-        """Environment for the subprocess, per ``MCPServerConfig.inherit_env``:
-        allow-list (default) / full os.environ (legacy opt-in) / nothing,
-        always overlaid with the config's own ``env``."""
+    def _spawn_env(self, *, windows: bool | None = None) -> dict[str, str]:
+        """Build a secret-conscious child environment with required OS runtime vars."""
+        is_windows = os.name == "nt" if windows is None else windows
         if self.cfg.inherit_env is True:
             base = dict(os.environ)
         elif self.cfg.inherit_env is False:
             base = {}
         else:
+            safe_names = _SAFE_ENV_NAMES + (
+                _WINDOWS_SAFE_ENV_NAMES if is_windows else ()
+            )
             base = {k: v for k, v in os.environ.items()
-                    if k in _SAFE_ENV_NAMES}
+                    if k.upper() in safe_names}
+        if is_windows and self.cfg.inherit_env is not True:
+            base.update(
+                (key, value)
+                for key, value in os.environ.items()
+                if key.upper() in _WINDOWS_SAFE_ENV_NAMES
+            )
         return {**base, **self.cfg.env}
 
     async def _read_loop(self) -> None:
@@ -414,26 +433,47 @@ class _StdioSession:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=grace)
             except asyncio.TimeoutError:
-                self._kill_group(proc)
+                await self._kill_group(proc)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
-                    log.warning("MCP server %s did not exit after SIGKILL",
-                                self.cfg.name)
+                    proc.kill()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        log.warning("MCP server %s did not exit after forced termination",
+                                    self.cfg.name)
         for task in (self._reader, self._stderr_task):
             if task:
                 task.cancel()
         self._reader = None
         self._stderr_task = None
 
-    def _kill_group(self, proc: asyncio.subprocess.Process) -> None:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
+    async def _kill_group(self, proc: asyncio.subprocess.Process) -> None:
+        if os.name == "nt":
+            taskkill = shutil.which("taskkill")
+            if taskkill:
+                try:
+                    killer = await asyncio.create_subprocess_exec(
+                        taskkill, "/PID", str(proc.pid), "/T", "/F",
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(killer.wait(), timeout=3)
+                    if killer.returncode == 0:
+                        return
+                except (OSError, asyncio.TimeoutError):
+                    pass
+        else:
             try:
-                proc.kill()
-            except ProcessLookupError:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 class _HTTPSession:

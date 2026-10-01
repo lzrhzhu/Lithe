@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import codecs
 import os
 import shutil
@@ -43,6 +44,15 @@ def _find_shell(candidates: tuple[str, ...]) -> str | None:
     return next((path for name in candidates if (path := shutil.which(name))), None)
 
 
+def _powershell_script(command: str) -> str:
+    return (
+        "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        "$OutputEncoding = [Console]::OutputEncoding; "
+        + command
+    )
+
+
 def _command_argv(command: str, shell: str = "auto", *, windows: bool | None = None) -> list[str]:
     is_windows = os.name == "nt" if windows is None else windows
     selected = (shell or "auto").lower()
@@ -68,11 +78,26 @@ def _command_argv(command: str, shell: str = "auto", *, windows: bool | None = N
     elif selected == "powershell":
         executable = _find_shell(("pwsh", "powershell", "powershell.exe"))
         if executable:
-            return [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+            script = _powershell_script(command)
+            encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+            return [
+                executable,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-InputFormat",
+                "Text",
+                "-OutputFormat",
+                "Text",
+                "-EncodedCommand",
+                encoded,
+            ]
     elif selected == "cmd":
         executable = os.environ.get("COMSPEC") if is_windows else None
         executable = executable or _find_shell(("cmd.exe", "cmd"))
         if executable:
+            if is_windows:
+                command = "chcp 65001 >NUL & " + command
             return [executable, "/d", "/s", "/c", command]
     raise FileNotFoundError(f"未找到可用的 {selected} 执行器")
 

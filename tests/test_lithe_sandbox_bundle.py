@@ -68,6 +68,16 @@ async def test_run_file_traversal_rejected(tmp_path):
     assert res["exit_code"] == -1 and "越界" in res["stderr"]
 
 
+def test_sandbox_env_includes_windows_runtime_without_secrets(monkeypatch):
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setenv("AUTH_SECRET", "not-forwarded")
+    env = _sandbox_env(windows=True)
+    assert env["SYSTEMROOT"] == r"C:\Windows"
+    assert env["COMSPEC"] == r"C:\Windows\System32\cmd.exe"
+    assert "AUTH_SECRET" not in env
+
+
 def test_bwrap_argv_shape_and_venv_bind(tmp_path):
     r = CodeRunner(sys.executable, venv="/opt/venv", backend="bwrap")
     argv, cwd = r._full_argv([sys.executable, "-c", "x"], tmp_path)
@@ -197,15 +207,15 @@ async def test_execution_hides_secrets_from_child(monkeypatch, tmp_path):
 
 
 async def test_run_code_timeout_kills_grandchildren(tmp_path):
-    """孙子进程持有 stdout 管道：超时必须杀整个进程组并限时回收，
-    不能被一个 Popen(['sleep', ...]) 拖到永远。"""
     import time
 
     runner = _runner(timeout=0.5)
-    code = ("import subprocess\n"
-            "subprocess.Popen(['sleep', '30'])\n"
-            "import time\n"
-            "time.sleep(30)\n")
+    child_code = "import time; time.sleep(30)"
+    code = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        "time.sleep(30)\n"
+    )
     t0 = time.monotonic()
     res = await runner.run_code(str(tmp_path), code)
     elapsed = time.monotonic() - t0

@@ -205,27 +205,42 @@ async def test_close_graceful_and_stubborn_process_group():
     import os
     import time
 
-    async def lifecycle(env: dict, grace: float) -> float:
+    async def lifecycle(env: dict, grace: float) -> tuple[float, int]:
         mgr = MCPManager([_cfg(env=env)])
         try:
             await mgr.attach(ToolRegistry())
-            pid = mgr._sessions["fake"].proc.pid
+            proc = mgr._sessions["fake"].proc
+            pid = proc.pid
             started = time.monotonic()
             await mgr._sessions["fake"].close(grace=grace)
             elapsed = time.monotonic() - started
-            try:
-                os.kill(pid, 0)
-                raise AssertionError("进程仍存活")
-            except ProcessLookupError:
-                pass
-            return elapsed
+            if os.name == "nt":
+                assert proc.returncode is not None
+            else:
+                try:
+                    os.kill(pid, 0)
+                    raise AssertionError("进程仍存活")
+                except ProcessLookupError:
+                    pass
+            return elapsed, pid
         finally:
             await mgr.close()
 
-    graceful = await lifecycle({}, grace=5.0)
+    graceful, _ = await lifecycle({}, grace=5.0)
     assert graceful < 5.0, "正常服务器应在宽限期内自行退出"
-    stubborn = await lifecycle({"FAKE_STUBBORN": "1"}, grace=0.5)
+    stubborn, pid = await lifecycle({"FAKE_STUBBORN": "1"}, grace=0.5)
     assert stubborn < 10.0, "顽固服务器也应被进程组击杀并回收"
+    if os.name == "nt":
+        import re
+
+        result = await asyncio.create_subprocess_exec(
+            "tasklist", "/FI", f"PID eq {pid}", "/NH",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await result.communicate()
+        assert result.returncode == 0
+        assert re.search(rf"\b{pid}\b", stdout.decode()) is None
 
 
 async def test_cached_registry_self_heals_after_restart():

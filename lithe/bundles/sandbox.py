@@ -19,6 +19,7 @@ import asyncio
 import os
 import signal
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from collections.abc import Callable
@@ -36,18 +37,22 @@ _SAFE_ENV_NAMES = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM")
 # running any code. TEMP/TMP back tempfile, COMSPEC/PATHEXT back subprocess
 # spawning. None of these carry secrets.
 _WIN_SAFE_ENV_NAMES = (
-    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
-    "TEMP", "TMP", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE",
+    "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "OS", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
 )
 
 
-def _sandbox_env() -> dict[str, str]:
+def _sandbox_env(*, windows: bool | None = None) -> dict[str, str]:
     """Secret-free env for the child: a fixed allow-list forwarded from the
     parent plus a few hard-coded runtime vars. Never copies os.environ wholesale,
     so secrets (AUTH_SECRET / *_API_KEY / ...) can never reach executed code."""
+    is_windows = os.name == "nt" if windows is None else windows
     env = {"HOME": "/tmp", "MPLBACKEND": "Agg", "XDG_CACHE_HOME": "/tmp/.cache",
-           "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
-    names = _SAFE_ENV_NAMES + (_WIN_SAFE_ENV_NAMES if os.name == "nt" else ())
+            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8"}
+
+    names = _SAFE_ENV_NAMES + (_WIN_SAFE_ENV_NAMES if is_windows else ())
     for name in names:
         val = os.environ.get(name)
         if val:
@@ -177,18 +182,22 @@ class CodeRunner:
         env = _sandbox_env()
         full, cwd = self._full_argv(tail, root)
         started = time.time()
+        process_options = (
+            {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+            if os.name == "nt"
+            else {"start_new_session": True}
+        )
         try:
             proc = await asyncio.create_subprocess_exec(
-                *full, cwd=cwd,
+                *full,
+                cwd=cwd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                # Own process group: on timeout the whole group is killed, so
-                # model-spawned grandchildren (subprocess.Popen) die too
-                # instead of surviving and holding the stdout pipe open.
-                start_new_session=True,
+                **process_options,
             )
+
         except FileNotFoundError:
             return _err_result(f"执行器未找到: {full[0]}")
 
@@ -212,8 +221,10 @@ class CodeRunner:
         # Head+tail truncation, not head-only: Python prints tracebacks at the
         # END of stderr and results at the END of stdout — cutting the tail
         # would hide exactly the part the model needs to self-correct.
-        out = truncate_tool_result(out_b.decode("utf-8", "replace"), self.max_output)
-        err = truncate_tool_result(err_b.decode("utf-8", "replace"), self.max_output)
+        out_text = out_b.decode("utf-8", "replace").replace("\r\n", "\n")
+        err_text = err_b.decode("utf-8", "replace").replace("\r\n", "\n")
+        out = truncate_tool_result(out_text, self.max_output)
+        err = truncate_tool_result(err_text, self.max_output)
         if timed_out:
             err += f"\n[执行超时（{self.timeout:.0f}s 已终止）]"
         return {"stdout": out, "stderr": err,

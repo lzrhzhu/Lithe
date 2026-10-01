@@ -502,8 +502,15 @@ async def test_walk_and_search_skip_symlinks(tmp_path):
     (root / "note.txt").write_text("inside secret", encoding="utf-8")
     outside = tmp_path / "outside.txt"
     outside.write_text("HOST SECRET should-not-leak", encoding="utf-8")
-    os.symlink(outside, root / "leak.txt")
-    os.symlink(tmp_path / "nope-missing", root / "dangling")
+    try:
+        os.symlink(outside, root / "leak.txt")
+        os.symlink(tmp_path / "nope-missing", root / "dangling")
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            import pytest
+
+            pytest.skip("creating symlinks requires Windows Developer Mode or privileges")
+        raise
 
     ws = Workspace(root)
     walked = [rel for rel, _p in ws.walk()]
