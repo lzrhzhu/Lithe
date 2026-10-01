@@ -19,6 +19,10 @@ from pathlib import Path
 # unnecessary) once lithe is pip-installed.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 from lithe import AgentContext, LLMConfig, ToolCategory, ToolRegistry, ToolResult, ToolSpec  # noqa: E402
 from lithe.bundles import AgentHost, JsonlRunStore, undo_run  # noqa: E402
 
