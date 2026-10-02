@@ -34,8 +34,8 @@ from collections.abc import AsyncIterator
 import httpx
 
 from .llm import (
-    _jitter, _retry_after, _retryable_status, bearer_headers, chat_completion,
-    iter_chat_completion, iter_sse_lines,
+    _annotate_extra_body, _jitter, _retry_after, _retryable_status,
+    bearer_headers, chat_completion, iter_chat_completion, iter_sse_lines,
 )
 
 log = logging.getLogger("lithe.transports")
@@ -67,6 +67,7 @@ class LLMTransport(Protocol):
         temperature: float | None = None, attempts: int = 1,
         sleep_429: float = 0.0, sleep_err: float = 0.0,
         include_reasoning: bool = True, reasoning_scope: str = "loop",
+        extra_body: dict | None = None, extra_headers: dict | None = None,
     ) -> TransportResult: ...
 
 
@@ -89,6 +90,68 @@ def _flatten_text(content: Any) -> str:
                 out.append(p)
         return "".join(out)
     return str(content)
+
+
+def _content_blocks(content: Any, *, role: str) -> list[dict] | None:
+    """Map chat content blocks to Responses content blocks, or return None.
+
+    ``None`` means "plain text is enough" (a string, an empty list, or a
+    list of only-string parts): the caller then uses its text-only fast
+    path, which keeps the 99%-text case byte-identical to before. Otherwise:
+
+    - text blocks (``text`` / ``input_text`` / ``output_text``) map to the
+      role-appropriate Responses text type;
+    - ``image_url`` blocks map to ``input_image`` (the URL — remote
+      ``https://`` or inline ``data:`` base64 — passes through verbatim);
+    - anything else **raises**: silently dropping a block would have the
+      model answer about content it never saw, which is the worst failure
+      mode (plausible but wrong). A loud error lets the host switch to the
+      chat transport or drop the block deliberately.
+    """
+    if not isinstance(content, list) or not content:
+        return None
+    text_type = "output_text" if role == "assistant" else "input_text"
+    out: list[dict] = []
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                out.append({"type": text_type, "text": part})
+            continue
+        if not isinstance(part, dict):
+            raise ValueError(
+                f"cannot map content block {part!r} onto the Responses "
+                f"input format (supported: text, image_url)")
+        ptype = part.get("type")
+        if ptype in ("text", "input_text", "output_text"):
+            out.append({"type": text_type, "text": part.get("text") or ""})
+        elif ptype == "image_url":
+            url = (part.get("image_url") or {}).get("url") \
+                if isinstance(part.get("image_url"), dict) else None
+            if not isinstance(url, str) or not url:
+                raise ValueError("image_url block without a usable url")
+            out.append({"type": "input_image", "image_url": url})
+        else:
+            raise ValueError(
+                f"cannot map content block type {ptype!r} onto the Responses "
+                f"input format (supported: text, image_url)")
+    return out or None
+
+
+def _merge_extra(extra_body: dict | None, internal: dict) -> dict:
+    """Merge host-supplied body fields under the internally computed ones.
+
+    ``extra_body`` (e.g. ``LLMConfig.extra_body``) carries vendor extensions
+    the kernel does not model (``top_p``, ``seed``, ``enable_thinking``,
+    ``reasoning`` effort, ...). Internal keys (``tools``, ``tool_choice``,
+    ``max_tokens`` / ``max_output_tokens``, ...) win on collision: the loop
+    mechanics must not be silently broken by a payload field, and those knobs
+    have first-class ``LLMConfig`` members already.
+    """
+    if not extra_body:
+        return internal
+    merged = dict(extra_body)
+    merged.update(internal)
+    return merged
 
 
 def norm_usage(usage: dict | None) -> dict:
@@ -176,17 +239,19 @@ class ChatCompletionsTransport:
         self, client, *, base_url, api_key, model, messages,
         tools=None, tool_choice=None, max_tokens=None, temperature=None,
         attempts=1, sleep_429=0.0, sleep_err=0.0, include_reasoning=True,
-        reasoning_scope="loop",
+        reasoning_scope="loop", extra_body=None, extra_headers=None,
     ) -> TransportResult:
         # include_reasoning / reasoning_scope are no-ops here: chat-completions
         # reasoning (DeepSeek-style reasoning_content / <think>) is per-turn
         # state that must NOT be replayed — the responses-protocol reasoning
         # items are the only pass-back flavor.
-        payload_extra = self._payload_extra(tools, tool_choice, max_tokens,
-                                            temperature)
+        payload_extra = _merge_extra(
+            extra_body,
+            self._payload_extra(tools, tool_choice, max_tokens, temperature))
         data = await chat_completion(
             client, base_url=base_url, api_key=api_key, model=model,
             messages=messages, payload_extra=payload_extra or None,
+            extra_headers=extra_headers, extra_body=extra_body,
             attempts=attempts, sleep_429=sleep_429, sleep_err=sleep_err,
             log_name="assistant",
         )
@@ -196,7 +261,7 @@ class ChatCompletionsTransport:
         self, client, *, base_url, api_key, model, messages,
         tools=None, tool_choice=None, max_tokens=None, temperature=None,
         attempts=1, sleep_429=0.0, sleep_err=0.0, include_reasoning=True,
-        reasoning_scope="loop",
+        reasoning_scope="loop", extra_body=None, extra_headers=None,
     ) -> AsyncIterator[dict]:
         """Streamed variant of :meth:`complete`.
 
@@ -205,13 +270,16 @@ class ChatCompletionsTransport:
         requested so the final chunk carries token usage; gateways that reject
         that field get one retry without it (remembered for the process).
         """
-        extra = self._payload_extra(tools, tool_choice, max_tokens, temperature)
+        extra = _merge_extra(
+            extra_body,
+            self._payload_extra(tools, tool_choice, max_tokens, temperature))
         if self._include_usage:
             extra = {**extra, "stream_options": {"include_usage": True}}
         try:
             async for part in iter_chat_completion(
                     client, base_url=base_url, api_key=api_key, model=model,
                     messages=messages, payload_extra=extra or None,
+                    extra_headers=extra_headers, extra_body=extra_body,
                     attempts=attempts, sleep_429=sleep_429, sleep_err=sleep_err,
                     log_name="assistant-stream"):
                 if "result" in part:
@@ -233,6 +301,7 @@ class ChatCompletionsTransport:
         async for part in iter_chat_completion(
                 client, base_url=base_url, api_key=api_key, model=model,
                 messages=messages, payload_extra=extra or None,
+                extra_headers=extra_headers, extra_body=extra_body,
                 attempts=1,  # one replay, not a fresh retry budget
                 sleep_429=sleep_429, sleep_err=sleep_err,
                 log_name="assistant-stream"):
@@ -315,12 +384,18 @@ def _messages_to_input(messages: list[dict], *,
                     input_items.append(dict(r))
 
         # user / assistant (and any other role)
-        text = _flatten_text(content)
-        ctype = "output_text" if role == "assistant" else "input_text"
-        input_items.append({
-            "role": role or "user",
-            "content": [{"type": ctype, "text": text or ""}],
-        })
+        blocks = _content_blocks(content, role=role or "user")
+        if blocks is not None:
+            # Multimodal content (text + image blocks) maps block-by-block;
+            # unmappable blocks raise rather than degrade silently.
+            input_items.append({"role": role or "user", "content": blocks})
+        else:
+            text = _flatten_text(content)
+            ctype = "output_text" if role == "assistant" else "input_text"
+            input_items.append({
+                "role": role or "user",
+                "content": [{"type": ctype, "text": text or ""}],
+            })
         # assistant tool_calls → function_call items
         for tc in msg.get("tool_calls") or []:
             if not isinstance(tc, dict):
@@ -425,10 +500,11 @@ def _parse_output(data: dict) -> TransportResult:
 async def _post_responses(
     client, base_url: str, api_key: str, payload: dict, *,
     attempts: int, sleep_429: float, sleep_err: float,
+    extra_headers: dict | None = None, extra_body: dict | None = None,
 ) -> dict:
     """POST to the Responses endpoint (``base_url`` is the full ``/responses`` URL)
     with the same retry policy as :func:`chat_completion`."""
-    headers = bearer_headers(api_key)
+    headers = bearer_headers(api_key, extra_headers)
     url = base_url
     last_exc: Exception | None = None
     for attempt in range(attempts):
@@ -462,7 +538,7 @@ async def _post_responses(
             if sleep_err:
                 await asyncio.sleep(_jitter(sleep_err * (attempt + 1)))
     assert last_exc is not None
-    raise last_exc
+    raise _annotate_extra_body(last_exc, extra_body)
 
 
 class ResponsesTransport:
@@ -482,15 +558,22 @@ class ResponsesTransport:
     ``reasoning_scope``).
 
     Degradation cascade on a 400 the gateway rejects the payload for: first
-    the ``include`` parameter is dropped (remembered process-wide), then — if
-    the input still carried reasoning items — reasoning replay is dropped for
-    that one call. Both fall back on availability over quality; a genuinely
-    malformed payload fails identically on the final attempt.
+    the ``include`` parameter is dropped (remembered per transport instance —
+    one gateway's rejection must not flip behavior for other hosts/endpoints
+    in the same process), then — if the input still carried reasoning items —
+    reasoning replay is dropped for that one call. Both fall back on
+    availability over quality; a genuinely malformed payload fails
+    identically on the final attempt.
     """
 
-    # Remembered per process: cleared after a gateway 400 that looks like a
-    # rejection of the `include` parameter, so later calls omit it.
-    _INCLUDE_REASONING = True
+    def __init__(self) -> None:
+        # Remembered per instance (a runtime owns one transport for its
+        # lifetime): cleared after a gateway 400 that looks like a rejection
+        # of the `include` parameter, so later calls from THIS transport omit
+        # it. Instance-level mirrors ChatCompletionsTransport._include_usage;
+        # the previous class-level flag leaked one gateway's quirk to every
+        # other endpoint in the process.
+        self._include_reasoning = True
 
     def _payload(self, messages, tools, tool_choice, max_tokens, temperature,
                  *, stream: bool, include_reasoning: bool,
@@ -523,6 +606,7 @@ class ResponsesTransport:
         self, client, *, base_url, api_key, model, messages, tools,
         tool_choice, max_tokens, temperature, attempts, sleep_429,
         sleep_err, include_reasoning, reasoning_scope,
+        extra_body=None, extra_headers=None,
     ):
         """Non-stream call with the 400-degradation cascade (see class doc)."""
         want_reasoning = include_reasoning
@@ -531,20 +615,22 @@ class ResponsesTransport:
                                     temperature, stream=False,
                                     include_reasoning=want_reasoning,
                                     reasoning_scope=reasoning_scope)
+            payload = _merge_extra(extra_body, payload)
             payload["model"] = model
-            if include_reasoning and ResponsesTransport._INCLUDE_REASONING:
+            if include_reasoning and self._include_reasoning:
                 payload["include"] = ["reasoning.encrypted_content"]
             try:
                 return await _post_responses(
                     client, base_url, api_key, payload,
-                    attempts=attempts, sleep_429=sleep_429, sleep_err=sleep_err)
+                    attempts=attempts, sleep_429=sleep_429, sleep_err=sleep_err,
+                    extra_headers=extra_headers, extra_body=extra_body)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code != 400:
                     raise
-                if "include" in payload and ResponsesTransport._INCLUDE_REASONING:
-                    # plausibly an `include` field rejection: flip the
-                    # process flag and retry without it.
-                    ResponsesTransport._INCLUDE_REASONING = False
+                if "include" in payload and self._include_reasoning:
+                    # plausibly an `include` field rejection: flip this
+                    # instance's flag and retry without it.
+                    self._include_reasoning = False
                     log.warning("[responses] retrying without reasoning include "
                                 "after HTTP 400")
                     continue
@@ -564,7 +650,7 @@ class ResponsesTransport:
         self, client, *, base_url, api_key, model, messages,
         tools=None, tool_choice=None, max_tokens=None, temperature=None,
         attempts=1, sleep_429=0.0, sleep_err=0.0, include_reasoning=True,
-        reasoning_scope="loop",
+        reasoning_scope="loop", extra_body=None, extra_headers=None,
     ) -> TransportResult:
         data = await self._complete_with_fallback(
             client, base_url=base_url, api_key=api_key, model=model,
@@ -572,16 +658,18 @@ class ResponsesTransport:
             max_tokens=max_tokens, temperature=temperature,
             attempts=attempts, sleep_429=sleep_429, sleep_err=sleep_err,
             include_reasoning=include_reasoning,
-            reasoning_scope=reasoning_scope)
+            reasoning_scope=reasoning_scope,
+            extra_body=extra_body, extra_headers=extra_headers)
         return _parse_output(data)
 
     async def _stream_attempts(
         self, client, base_url: str, api_key: str, payload: dict, *,
         attempts: int, sleep_429: float, sleep_err: float,
+        extra_headers: dict | None = None, extra_body: dict | None = None,
     ) -> AsyncIterator[dict]:
         """One streamed attempt cycle over an established payload (see
         :meth:`complete_stream`)."""
-        headers = bearer_headers(api_key)
+        headers = bearer_headers(api_key, extra_headers)
         last_exc: Exception | None = None
         for attempt in range(attempts):
             delivered = False
@@ -641,19 +729,21 @@ class ResponsesTransport:
                             attempt + 1, attempts,
                             " (fatal, not retrying)" if fatal else "", exc)
                 if delivered or fatal:
-                    raise
+                    # Annotated when a 400 may stem from extra_body fields
+                    # (bare `raise` would skip the final annotation).
+                    raise _annotate_extra_body(exc, extra_body) from exc
                 if attempt + 1 >= attempts:
                     break
                 if sleep_err:
                     await asyncio.sleep(_jitter(sleep_err * (attempt + 1)))
         assert last_exc is not None
-        raise last_exc
+        raise _annotate_extra_body(last_exc, extra_body)
 
     async def complete_stream(
         self, client, *, base_url, api_key, model, messages,
         tools=None, tool_choice=None, max_tokens=None, temperature=None,
         attempts=1, sleep_429=0.0, sleep_err=0.0, include_reasoning=True,
-        reasoning_scope="loop",
+        reasoning_scope="loop", extra_body=None, extra_headers=None,
     ) -> AsyncIterator[dict]:
         """Streamed variant of :meth:`complete` over the Responses API.
 
@@ -672,15 +762,17 @@ class ResponsesTransport:
                                     temperature, stream=True,
                                     include_reasoning=want_reasoning,
                                     reasoning_scope=reasoning_scope)
+            payload = _merge_extra(extra_body, payload)
             payload["model"] = model
-            if include_reasoning and ResponsesTransport._INCLUDE_REASONING:
+            if include_reasoning and self._include_reasoning:
                 payload["include"] = ["reasoning.encrypted_content"]
             delivered = False
             try:
                 async for part in self._stream_attempts(
                         client, base_url, api_key, payload,
                         attempts=attempts, sleep_429=sleep_429,
-                        sleep_err=sleep_err):
+                        sleep_err=sleep_err, extra_headers=extra_headers,
+                        extra_body=extra_body):
                     if "delta" in part:
                         delivered = True
                     yield part
@@ -688,8 +780,8 @@ class ResponsesTransport:
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code != 400 or delivered:
                     raise
-                if "include" in payload and ResponsesTransport._INCLUDE_REASONING:
-                    ResponsesTransport._INCLUDE_REASONING = False
+                if "include" in payload and self._include_reasoning:
+                    self._include_reasoning = False
                     log.warning("[responses-stream] retrying without reasoning "
                                 "include after HTTP 400")
                     continue

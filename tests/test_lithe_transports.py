@@ -157,7 +157,7 @@ async def test_responses_transport_400_drops_reasoning_input_last():
             return _Resp(200, {"output": [{"type": "message",
                                            "content": [{"type": "output_text", "text": "ok"}]}]})
 
-    ResponsesTransport._INCLUDE_REASONING = True
+    ResponsesTransport()
     t = ResponsesTransport()
     msgs = [
         {"role": "user", "content": "go"},
@@ -172,7 +172,6 @@ async def test_responses_transport_400_drops_reasoning_input_last():
     assert "include" in payloads[0] and "include" not in payloads[1]
     assert any(i.get("type") == "reasoning" for i in payloads[1]["input"])
     assert not any(i.get("type") == "reasoning" for i in payloads[2]["input"])
-    ResponsesTransport._INCLUDE_REASONING = True  # 恢复类标记
 
 
 # -- transport end-to-end (mocked httpx) --------------------------------------
@@ -249,7 +248,6 @@ async def test_responses_transport_requests_encrypted_reasoning():
                         "content": [{"type": "output_text", "text": "ok"}]}]}
     client = _Client(body)
     t = ResponsesTransport()
-    ResponsesTransport._INCLUDE_REASONING = True  # 类标记可能被其它测试翻转
     await t.complete(client, base_url="https://gw/responses", api_key="k",
                      model="m", messages=[{"role": "user", "content": "hi"}])
     assert client.payload["include"] == ["reasoning.encrypted_content"]
@@ -262,7 +260,7 @@ async def test_responses_transport_requests_encrypted_reasoning():
 
 
 async def test_responses_transport_400_on_include_retries_without():
-    """网关 400 拒绝 include 字段：翻转类标记并去掉 include 重试一次。"""
+    """网关 400 拒绝 include 字段：翻转实例标记并去掉 include 重试一次。"""
     payloads = []
 
     class _C:
@@ -277,14 +275,42 @@ async def test_responses_transport_400_on_include_retries_without():
             return _Resp(200, {"output": [{"type": "message",
                                            "content": [{"type": "output_text", "text": "ok"}]}]})
 
-    ResponsesTransport._INCLUDE_REASONING = True
     t = ResponsesTransport()
     result = await t.complete(_C(), base_url="https://gw/responses", api_key="k",
                               model="m", messages=[{"role": "user", "content": "hi"}])
     assert result["content"] == "ok"
     assert "include" in payloads[0] and "include" not in payloads[1]
-    assert ResponsesTransport._INCLUDE_REASONING is False
-    ResponsesTransport._INCLUDE_REASONING = True  # 恢复，避免影响其它测试
+    assert t._include_reasoning is False
+    # 降级记忆是实例级：另一个实例（另一端点/host）不受影响
+    t2 = ResponsesTransport()
+    assert t2._include_reasoning is True
+
+
+async def test_include_reasoning_degradation_is_per_instance():
+    """include 降级记忆是实例级：一个网关的 400 不得关闭同进程其它端点的
+    reasoning 请求（此前为类属性，进程内全局串扰）。"""
+    bodies = []
+
+    class _C:
+        async def post(self, url, json=None, headers=None):
+            bodies.append(json)
+            if len(bodies) == 1:
+                return _Resp(400, {})   # 网关 A：拒绝 include
+            return _Resp(200, {"output": [{"type": "message",
+                                           "content": [{"type": "output_text", "text": "ok"}]}]})
+
+    t_a = ResponsesTransport()
+    await t_a.complete(_C(), base_url="https://a/responses", api_key="k",
+                       model="m", messages=[{"role": "user", "content": "hi"}])
+    assert t_a._include_reasoning is False
+    # 网关 B（新实例）：第一次请求仍带 include
+    client_b = _Client({"output": [{"type": "message",
+                                    "content": [{"type": "output_text", "text": "ok"}]}]})
+    t_b = ResponsesTransport()
+    await t_b.complete(client_b, base_url="https://b/responses", api_key="k",
+                       model="m", messages=[{"role": "user", "content": "hi"}])
+    assert client_b.payload["include"] == ["reasoning.encrypted_content"]
+    assert t_b._include_reasoning is True
 
 
 async def test_responses_transport_429_retries_via_retry_after_without_sleep():

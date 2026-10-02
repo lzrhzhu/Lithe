@@ -29,6 +29,12 @@ ToolHandler = Callable[[AgentContext, dict], Awaitable["ToolResult"]]
 # substitute); returning None lets the call proceed.
 ToolMiddleware = Callable[[AgentContext, str, dict], Awaitable["ToolResult | None"]]
 
+# A transform rewrites one call's arguments *before* validation:
+# ``async (ctx, name, args) -> args``. Unlike middleware it cannot veto —
+# it normalizes what the model sent (canonicalize paths, inject defaults,
+# redact secrets) so validation and the handler see corrected args.
+ToolTransform = Callable[[AgentContext, str, dict], Awaitable[dict]]
+
 # JSON-Schema "type" names → python checks for minimal argument validation.
 # bool is excluded from number/integer (python bools are ints — a model passing
 # true where a number is required must be corrected, not silently accepted).
@@ -53,10 +59,12 @@ def _matches_type(value: Any, want: Any) -> bool:
 def validate_args(parameters: dict, args: dict) -> str | None:
     """Minimal JSON-Schema check of one tool call's arguments.
 
-    Covers exactly the two failure classes a model most often makes and can
-    self-correct from feedback: a declared ``required`` property missing, and a
-    top-level property whose declared ``type`` the value violates. Anything
-    subtler (nested schemas, refs, unions of shapes) is the handler's business.
+    Covers exactly the failure classes a model most often makes and can
+    self-correct from feedback: a declared ``required`` property missing, a
+    top-level property whose declared ``type`` the value violates, and a
+    top-level property whose declared ``enum`` doesn't contain the value.
+    Anything subtler (nested schemas, refs, unions of shapes) is the
+    handler's business.
 
     Returns a human-readable error for the model, or ``None`` when valid /
     when the schema is too loose to check (non-dict, no properties).
@@ -81,6 +89,13 @@ def validate_args(parameters: dict, args: dict) -> str | None:
             if want is not None and not _matches_type(args[name], want):
                 problems.append(f"参数 {name} 应为 {want}，"
                                 f"得到 {type(args[name]).__name__}")
+            enum = decl.get("enum")
+            # Enum membership is listed with the allowed values: the model
+            # can act on "must be one of [a, b]" without another round trip
+            # through the schema.
+            if isinstance(enum, list) and args[name] not in enum:
+                problems.append(f"参数 {name} 只能取 {enum} 之一，"
+                                f"得到 {args[name]!r}")
     return "；".join(problems) if problems else None
 
 
@@ -151,6 +166,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._entries: dict[str, _Entry] = {}
         self._middlewares: list[ToolMiddleware] = []
+        self._transforms: list[ToolTransform] = []
 
     def add_middleware(self, middleware: ToolMiddleware) -> None:
         """Install a pre-dispatch middleware: ``async (ctx, name, args)``.
@@ -170,6 +186,26 @@ class ToolRegistry:
             registry.add_middleware(confirm_writes)
         """
         self._middlewares.append(middleware)
+
+    def add_transform(self, transform: ToolTransform) -> None:
+        """Install a pre-validation argument transform:
+        ``async (ctx, name, args) -> args``.
+
+        Transforms run in installation order *before* ``validate_args`` and
+        before any middleware, on every dispatch. They normalize what the
+        model sent — canonicalize paths, inject defaults, clamp sizes,
+        redact secrets — and must return the (possibly same) args dict.
+        Unlike a middleware a transform cannot veto; to deny a call use
+        :meth:`add_middleware`, which sees the transformed args. e.g.::
+
+            async def strip_dot_slash(ctx, name, args):
+                if "path" in args and isinstance(args["path"], str):
+                    args = {**args, "path": args["path"].lstrip("./")}
+                return args
+
+            registry.add_transform(strip_dot_slash)
+        """
+        self._transforms.append(transform)
 
     def register(
         self,
@@ -250,6 +286,18 @@ class ToolRegistry:
                     f"工具 {name} 的参数应为 JSON 对象，"
                     f"得到 {type(args).__name__ if args is not None else '无法解析的 JSON'}。"
                     f"请修正后重新调用。")
+        for tf in self._transforms:
+            # Transforms run before validation by design: normalization is
+            # supposed to fix what the model got wrong (paths, defaults,
+            # redaction), so validation and middlewares see corrected args.
+            args = await tf(ctx, name, args)
+        if not isinstance(args, dict):
+            # A broken transform must not smuggle junk into validate_args or
+            # the handler — surface it as the same failed-call contract.
+            return ToolResult(
+                False, "参数校验失败",
+                f"工具 {name} 的参数变换产生了非对象结果"
+                f"（{type(args).__name__}），已拒绝执行。")
         if entry.spec.validate:
             problem = validate_args(entry.spec.parameters, args)
             if problem is not None:

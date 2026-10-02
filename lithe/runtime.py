@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import queue as _queue
 import threading
 import uuid
 from dataclasses import dataclass
@@ -44,8 +45,11 @@ _BUDGET_FALLBACK = ("（已达到本次运行的成本或 token 预算，运行�
                     "已完成的步骤仍然有效；如需继续，请提高预算后重新提问。）")
 
 # Nudge appended to a tool result when the *identical* (tool, args) call is
-# issued more than this many times in one run — the classic stuck-model loop.
-# None disables the repeat guard.
+# issued more than this many times with no mutating (WRITE/META) tool in
+# between — the classic stuck-model loop. A mutating tool bumps the "epoch"
+# and resets every signature's count: a read after a write is a fresh
+# observation (the workspace stale-file guard even demands re-reads), not a
+# stuck repeat. None disables the repeat guard.
 DEFAULT_REPEAT_CALL_LIMIT = 3
 
 # Default mid-run context budget (~chars of messages incl. tool results).
@@ -61,12 +65,41 @@ _TRIM_STAGES = (1200, 400, 100)
 _TRIM_FLOOR = 60
 _KEEP_RECENT_TOOL_MSGS = 2
 
+# Escalation when shrinking cannot reach the budget (the overage is prose /
+# reasoning / protected-recent content, none of which may shrink): whole old
+# exchanges — one assistant turn plus its tool results, always as a complete
+# unit — are dropped and replaced by a single omission note, so the next
+# request still goes out under budget instead of a guaranteed window
+# overflow. Dropped turns are already recorded with sinks; only the live
+# model context loses them. The newest exchanges are never dropped.
+_KEEP_RECENT_EXCHANGES = 2
+_OMITTED_TURNS_NOTE = ("（系统注：为控制上下文长度，此前若干轮工具调用过程已从"
+                       "上下文中移除；这些步骤的结论已体现在其后的对话内容中，"
+                       "无需重复执行。）")
+
 
 def _message_size(m: dict) -> int:
     n = 0
     content = m.get("content")
     if isinstance(content, str):
         n += len(content)
+    elif isinstance(content, list):
+        # Multimodal content: text blocks count as their text length, image
+        # blocks by their payload length (an inline data: URL IS the image,
+        # in chars). Previously list content counted as 0, so a multimodal
+        # conversation under-reported its size and skewed the trim budget
+        # and the chars-per-token calibration.
+        for part in content:
+            if isinstance(part, str):
+                n += len(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    n += len(text)
+                iu = part.get("image_url")
+                url = iu.get("url") if isinstance(iu, dict) else None
+                if isinstance(url, str):
+                    n += len(url)
     tcs = m.get("tool_calls")
     if tcs:
         try:
@@ -91,14 +124,46 @@ def _context_size(messages: list[dict]) -> int:
     return sum(_message_size(m) for m in messages)
 
 
+def _exchange_units(messages: list[dict]) -> list[tuple[int, int]]:
+    """``(start, end)`` index ranges of complete exchanges — one assistant
+    message carrying ``tool_calls`` plus the contiguous tool results that
+    answer it. Dropping such a range never orphans a call or a result."""
+    units: list[tuple[int, int]] = []
+    i, n = 0, len(messages)
+    while i < n:
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            j = i + 1
+            while j < n and messages[j].get("role") == "tool":
+                j += 1
+            units.append((i, j))
+            i = j
+        else:
+            i += 1
+    return units
+
+
 def _trim_context(messages: list[dict], *, budget: int,
                   keep_recent: int = _KEEP_RECENT_TOOL_MSGS) -> int:
-    """Best-effort mid-run context compaction: shrink old tool-result contents
-    (head+tail, like memory replay) until the conversation fits ``budget``
-    chars. The newest ``keep_recent`` tool results are never touched — they
-    are what the model is actively working from. Structural validity is
-    preserved by construction: only ``content`` strings change, so every
-    assistant ``tool_call`` keeps its matching tool message.
+    """Best-effort mid-run context compaction, in two tiers.
+
+    Tier 1 shrinks old tool-result contents (head+tail, like memory replay)
+    until the conversation fits ``budget`` chars. The newest ``keep_recent``
+    tool results are never touched — they are what the model is actively
+    working from. Structural validity is preserved by construction: only
+    ``content`` strings change, so every assistant ``tool_call`` keeps its
+    matching tool message.
+
+    Tier 2 (escalation) fires when tier 1 cannot reach the budget — the
+    overage then lives in content tier 1 must not touch (user/assistant
+    prose, reasoning items, protected-recent tool results). Complete old
+    exchanges are dropped oldest-first and replaced by one omission note
+    (:data:`_OMITTED_TURNS_NOTE`), keeping the payload under budget instead
+    of sending a request that overflows the model's window. System and user
+    messages are never dropped, the newest ``_KEEP_RECENT_EXCHANGES``
+    exchanges are protected, and — to avoid losing history for nothing —
+    drops are committed only when they actually reach the budget; if even
+    dropping every droppable exchange would stay over, nothing is dropped.
 
     Returns the conversation's size in chars afterwards (also when no trim
     was needed), so callers can keep a running total without rescanning.
@@ -127,7 +192,39 @@ def _trim_context(messages: list[dict], *, budget: int,
             cut = c[:_TRIM_FLOOR] + "…[已压缩]"
             total += len(cut) - len(c)
             m["content"] = cut
-    return total
+    if total <= budget:
+        return total
+
+    # Tier 2: simulate dropping whole old exchanges; commit only if the
+    # simulation actually reaches the budget.
+    protected = set(tool_idx[-keep_recent:]) if keep_recent else set()
+    units = _exchange_units(messages)
+    droppable = units[:-_KEEP_RECENT_EXCHANGES] if _KEEP_RECENT_EXCHANGES \
+        else units
+    sim = total
+    drop_ranges: list[tuple[int, int]] = []
+    for start, end in droppable:
+        if sim <= budget:
+            break
+        if any(i in protected for i in range(start, end)):
+            break  # protection covers a suffix of exchanges: nothing older left
+        sim -= sum(_message_size(messages[i]) for i in range(start, end))
+        drop_ranges.append((start, end))
+    if not drop_ranges or sim > budget:
+        return total  # hopeless: overage lives in undroppable content
+    first_drop = drop_ranges[0][0]
+    drop_idxs = {i for start, end in drop_ranges for i in range(start, end)}
+    # stale omission notes from an earlier pass carry no state; remove them
+    # so the fresh note below stays unique
+    drop_idxs.update(i for i, m in enumerate(messages)
+                     if m.get("role") == "assistant" and not m.get("tool_calls")
+                     and m.get("content") == _OMITTED_TURNS_NOTE)
+    kept_before = sum(1 for i in range(first_drop) if i not in drop_idxs)
+    new_messages = [m for i, m in enumerate(messages) if i not in drop_idxs]
+    new_messages.insert(kept_before,
+                        {"role": "assistant", "content": _OMITTED_TURNS_NOTE})
+    messages[:] = new_messages
+    return _context_size(messages)
 
 
 @dataclass
@@ -154,6 +251,25 @@ class LLMConfig:
     giving cross-turn chain continuity for hosts that prefer quality over
     token cost (the kernel never compresses reasoning either way; a host
     decides when to compact).
+
+    ``extra_body`` carries vendor request fields the kernel does not model
+    (``top_p``, ``seed``, ``stop``, ``response_format``,
+    ``enable_thinking``, ``reasoning`` effort, ...) into the JSON payload of
+    every call, both transports; internally computed keys (``tools``,
+    ``tool_choice``, ``max_tokens`` ...) win on collision — those knobs have
+    first-class members here. ``default_headers`` merges over the bearer /
+    JSON content-type headers (OpenRouter's ``HTTP-Referer`` /
+    ``X-Title``, ``OpenAI-Organization``, ...). Values in both must be
+    JSON-serializable / header-safe.
+
+    ``pricing`` is a host-declared per-1M-token price table,
+    ``{"prompt": float, "completion": float, "cached_prompt": float?}``,
+    used to compute call cost when the gateway reports none (OpenAI's API
+    and many gateways never send ``usage.cost`` — without a table the
+    ``max_cost`` budget and cost accounting silently read 0 there). A
+    gateway-reported cost always wins over the computed one; cached input
+    is billed at ``cached_prompt`` when given, else at the ``prompt`` price
+    (over-counting is the safe direction for a budget).
     """
     model: str
     base_url: str
@@ -169,12 +285,26 @@ class LLMConfig:
     max_tokens: int | None = None
     reasoning_replay: bool = True
     reasoning_scope: str = "loop"
+    extra_body: dict | None = None
+    default_headers: dict | None = None
+    pricing: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         if self.reasoning_scope not in ("loop", "conversation"):
             raise ValueError(
                 f"LLMConfig.reasoning_scope must be 'loop' or 'conversation', "
                 f"got {self.reasoning_scope!r}")
+        if self.pricing is not None:
+            bad = sorted(k for k, v in self.pricing.items()
+                         if k not in ("prompt", "completion", "cached_prompt")
+                         or isinstance(v, bool)
+                         or not isinstance(v, (int, float)) or v < 0)
+            if bad or not ({"prompt", "completion"}
+                           & set(self.pricing)):
+                raise ValueError(
+                    "LLMConfig.pricing must map 'prompt' and/or 'completion' "
+                    "(optionally 'cached_prompt') to non-negative "
+                    f"per-1M-token prices; bad keys/values: {bad}")
 
 
 @dataclass
@@ -246,6 +376,29 @@ def _stop_triggered(stop) -> bool:
     return bool(stop)
 
 
+async def _drain_inbox(inbox) -> list[str]:
+    """Non-blocking drain of the steering inbox.
+
+    Accepts anything with a ``get_nowait()`` — an ``asyncio.Queue`` (same
+    loop) or a ``queue.Queue`` (a cross-thread host pushing from another
+    thread; thread-safe by construction). An empty queue ends the drain; a
+    broken inbox logs and returns what it had rather than killing the run —
+    steering is an auxiliary channel, never a load-bearing one.
+    """
+    if inbox is None:
+        return []
+    out: list[str] = []
+    while True:
+        try:
+            out.append(inbox.get_nowait())
+        except (asyncio.QueueEmpty, _queue.Empty):
+            return out
+        except Exception:  # noqa: BLE001 — a broken inbox must not kill the run
+            log.warning("steering inbox drain failed (ignored)",
+                        exc_info=True)
+            return out
+
+
 def _normalize_assistant(msg: dict) -> dict:
     """Keep only the OpenAI-relevant keys for the next request.
 
@@ -305,7 +458,14 @@ def _as_int(val) -> int:
         return 0
 
 
-def _extract_cost(data: dict) -> float:
+def _gateway_cost(data: dict) -> float | None:
+    """Cost as reported by the gateway, when it reports one at all.
+
+    Returns ``None`` when no cost field is present (OpenAI's API and many
+    gateways never send one) so the caller can fall back to a host-declared
+    price table — a reported 0.0 is a real answer ("this call was free"),
+    not the same as silence.
+    """
     usage = data.get("usage") or {}
     breakdown = usage.get("cost_breakdown") or {}
     for src in (breakdown.get("total_cost"), usage.get("cost"), data.get("cost")):
@@ -314,7 +474,43 @@ def _extract_cost(data: dict) -> float:
                 return float(src)
             except (TypeError, ValueError):
                 continue
-    return 0.0
+    return None
+
+
+def _computed_cost(pricing: dict | None, usage: dict) -> float:
+    """Cost from a host-declared per-1M-token price table (``LLMConfig.pricing``).
+
+    Cached input tokens are billed at ``cached_prompt`` when given, else at
+    the ``prompt`` price — over-counting a cache discount is the safe
+    direction for a budget. Returns 0.0 without a table, matching the
+    gateway-silent "unknown" accounting.
+    """
+    if not pricing:
+        return 0.0
+    p = pricing.get("prompt")
+    c = pricing.get("completion")
+    if p is None and c is None:
+        return 0.0
+    prompt_tok = _as_int(usage.get("prompt_tokens"))
+    comp_tok = _as_int(usage.get("completion_tokens"))
+    cached = min(_as_int(usage.get("cached_tokens")), prompt_tok)
+    cost = 0.0
+    if p is not None:
+        cached_price = pricing.get("cached_prompt", p)
+        cost += ((prompt_tok - cached) / 1e6) * p \
+            + (cached / 1e6) * cached_price
+    if c is not None:
+        cost += (comp_tok / 1e6) * c
+    return cost
+
+
+def _call_cost(cfg: LLMConfig, usage: dict) -> float:
+    """Per-call cost: the gateway's own number when it sends one, else the
+    host's price table, else 0.0 (unknown)."""
+    reported = _gateway_cost({"usage": usage})
+    if reported is not None:
+        return reported
+    return _computed_cost(cfg.pricing, usage)
 
 
 class AgentRuntime:
@@ -322,12 +518,14 @@ class AgentRuntime:
 
     Construct once (with a registry, an :class:`LLMConfig`, optional sinks, a
     step cap, and optional run budgets ``max_cost`` / ``max_total_tokens``
-    that end a runaway run with ``status="budget_exceeded"``); call
-    :meth:`run` per task. ``repeat_call_limit`` (default 3) nudges the model
-    when it issues the *identical* (tool, args) call yet again — the hint
-    rides inside the tool result, invisible to display events. Pass ``run``
-    a ``stats`` to read the final status / cost / step count after the
-    generator is exhausted.
+    that end a runaway run with ``status="budget_exceeded"``); call :meth:`run`
+    per task. ``repeat_call_limit`` (default 3) nudges the model when it
+    issues the *identical* (tool, args) call yet again with no WRITE/META
+    tool in between (a mutating tool resets the counters — reads after
+    writes are fresh observations, not stuck repeats) — the hint rides inside
+    the tool result, invisible to display events. Pass ``run`` a ``stats`` to
+    read the final status / cost / step count after the generator is
+    exhausted.
     """
 
     def __init__(
@@ -454,6 +652,7 @@ class AgentRuntime:
         *,
         stats: RunStats | None = None,
         stop: asyncio.Event | threading.Event | Callable[[], bool] | None = None,
+        inbox: Any | None = None,
     ) -> AsyncIterator[Event]:
         """Run the model ↔ tool loop until a final answer, an error, the step
         cap, or a cancellation.
@@ -471,6 +670,17 @@ class AgentRuntime:
         response nobody wants); when triggered the run ends with a
         ``cancelled`` event and ``stats.status == "cancelled"`` (in-flight
         tool calls still complete, so no mutation is left half-applied).
+
+        ``inbox`` is the steering channel: a queue of user texts (anything
+        with ``get_nowait()`` — ``asyncio.Queue`` in-loop, ``queue.Queue``
+        cross-thread) drained at each step boundary. Queued texts are
+        appended as user messages (and recorded / announced via
+        ``user_injected`` events) so the model incorporates them on its next
+        call — "the user typed while the agent worked". Precedence: stop
+        and budgets are checked first (steering cannot buy budget); the
+        forced wrap-up step skips the drain, since its tools are already
+        withheld and a new request could not be acted on — unconsumed items
+        stay in the host's queue.
         """
         stats = stats if stats is not None else RunStats()
         cfg = self.llm_config
@@ -479,6 +689,10 @@ class AgentRuntime:
         # runtimes (subagents) can propagate cancellation. Always set (even
         # to None) so a reused context never inherits a previous run's handle.
         ctx.shared["_runtime_stop"] = stop
+        # The steering handle is stashed for symmetry (a host-side tool or
+        # middleware may find it via ctx.shared), but subagent runtimes
+        # deliberately do NOT forward it: steering addresses the orchestrator.
+        ctx.shared["_runtime_inbox"] = inbox
         if self.emit_envelope:
             yield await self._emit(ctx, {"type": EventType.RUN_START,
                                          "run_id": ctx.run_id,
@@ -487,19 +701,23 @@ class AgentRuntime:
         # Running conversation size (chars), maintained incrementally so the
         # per-step context-fullness report doesn't rescan/serialize everything.
         size_state = {"chars": _context_size(messages)}
-        # Per-run (tool name, canonical args) → invocation count, feeding the
-        # identical-repeat nudge; fresh for every `run` call.
-        repeat_state: dict = {}
+        # Per-run identical-repeat state, feeding the stuck-model nudge:
+        # ``counts`` maps (tool name, canonical args) → (invocations, epoch);
+        # ``epoch`` bumps whenever a WRITE/META tool dispatches, which resets
+        # every signature's count (see _dispatch_at). Fresh for every `run`.
+        repeat_state: dict = {"epoch": 0, "counts": {}}
         if self.http_client is not None:
             async for event in self._drive(ctx, messages, tools_spec,
                                            self.http_client, cfg, stats,
-                                           size_state, repeat_state, stop):
+                                           size_state, repeat_state, stop,
+                                           inbox):
                 yield event
         else:
             async with httpx.AsyncClient(timeout=cfg.timeout) as client:
                 async for event in self._drive(ctx, messages, tools_spec,
                                                client, cfg, stats,
-                                               size_state, repeat_state, stop):
+                                               size_state, repeat_state, stop,
+                                               inbox):
                     yield event
         if self.emit_envelope:
             yield await self._emit(ctx, {
@@ -511,7 +729,7 @@ class AgentRuntime:
     async def _drive(
         self, ctx: AgentContext, messages: list[dict], tools_spec: list[dict],
         client: httpx.AsyncClient, cfg: LLMConfig, stats: RunStats,
-        size_state: dict, repeat_state: dict, stop=None,
+        size_state: dict, repeat_state: dict, stop=None, inbox=None,
     ) -> AsyncIterator[Event]:
         """The step loop over an established HTTP client (see :meth:`run`)."""
         for step in range(1, self.max_steps + 1):
@@ -531,8 +749,8 @@ class AgentRuntime:
             # for the GC's asyncgen finalizer.
             async with contextlib.aclosing(self._loop_step(
                     ctx, messages, tools_spec, client, cfg, stats, step,
-                    state, size_state, repeat_state, stop, wrap_up=wrap_up)) \
-                    as step_stream:
+                    state, size_state, repeat_state, stop, wrap_up=wrap_up,
+                    inbox=inbox)) as step_stream:
                 async for event in step_stream:
                     yield event
             if state["finished"]:
@@ -545,7 +763,7 @@ class AgentRuntime:
         self, ctx: AgentContext, messages: list[dict], tools_spec: list[dict],
         client: httpx.AsyncClient, cfg: LLMConfig, stats: RunStats, step: int,
         state: dict, size_state: dict, repeat_state: dict, stop=None,
-        wrap_up: bool = False,
+        wrap_up: bool = False, inbox=None,
     ) -> AsyncIterator[Event]:
         """Execute one model step, yielding its events as they happen.
 
@@ -576,6 +794,23 @@ class AgentRuntime:
             return
         yield await self._emit(ctx, {"type": EventType.STEP, "step": step})
 
+        if inbox is not None and not wrap_up:
+            # Steering channel: host-queued user texts enter the loop at the
+            # step boundary. Order of guarantees: stop and budgets were
+            # checked above (steering cannot buy budget, cancel always
+            # wins); wrap-up steps skip the drain — their tools are already
+            # withheld, so an injected request could not be acted on.
+            for text in await _drain_inbox(inbox):
+                if not (isinstance(text, str) and text.strip()):
+                    log.warning("ignoring non-text steering message: %r", text)
+                    continue
+                messages.append({"role": "user", "content": text})
+                size_state["chars"] += _message_size(messages[-1])
+                await self._record(ctx, {"role": "user", "content": text})
+                yield await self._emit(
+                    ctx, {"type": EventType.USER_INJECTED, "step": step,
+                          "text": text})
+
         if self.context_budget is not None or (
                 self.context_token_threshold and cfg.context_window):
             # Safety valve for long runs: without it a 35-step run of fat tool
@@ -583,9 +818,22 @@ class AgentRuntime:
             # API hard-fails the run. Old tool outputs shrink head+tail; the
             # structure (tool_call ↔ tool_result pairing) stays valid. The
             # budget is token-calibrated when the host declared a window.
+            # When shrinking cannot reach the budget, whole old exchanges are
+            # dropped (see _trim_context) — and if even that is not enough,
+            # the run logs once and still sends, rather than silently
+            # overflowing the window.
             budget = self._effective_char_budget(cfg, size_state)
             if budget is not None:
                 size_state["chars"] = _trim_context(messages, budget=budget)
+                if (size_state["chars"] > budget
+                        and not size_state.get("over_budget_logged")):
+                    size_state["over_budget_logged"] = True
+                    log.warning(
+                        "context still over budget after trimming and "
+                        "dropping old exchanges (%d > %d chars); the next "
+                        "model call may be rejected if the payload exceeds "
+                        "the model's window",
+                        size_state["chars"], budget)
         ctx_chars = size_state["chars"]
 
         eff_tools = None if wrap_up else (tools_spec or None)
@@ -606,7 +854,9 @@ class AgentRuntime:
                         attempts=cfg.attempts, sleep_429=cfg.sleep_429,
                         sleep_err=cfg.sleep_err,
                         include_reasoning=cfg.reasoning_replay,
-                        reasoning_scope=cfg.reasoning_scope)
+                        reasoning_scope=cfg.reasoning_scope,
+                        extra_body=cfg.extra_body,
+                        extra_headers=cfg.default_headers)
                     # aclosing: a cancellation (or a mid-stream failure) must
                     # close the transport stream — and drop the underlying
                     # HTTP response — instead of leaving it to the GC.
@@ -639,12 +889,20 @@ class AgentRuntime:
                         sleep_err=cfg.sleep_err,
                         include_reasoning=cfg.reasoning_replay,
                         reasoning_scope=cfg.reasoning_scope,
+                        extra_body=cfg.extra_body,
+                        extra_headers=cfg.default_headers,
                     )
             except httpx.HTTPStatusError as exc:
                 log.warning("agent model error: %s", exc)
+                message = f"模型请求失败（{exc.response.status_code}）"
+                hint = getattr(exc, "lithe_hint", None)
+                if hint:
+                    # Annotated by the transport: a 400 that may stem from
+                    # host-supplied extra_body fields the endpoint rejects.
+                    message = f"{message}。{hint}"
                 yield await self._emit(
                     ctx, {"type": EventType.ERROR, "code": exc.response.status_code,
-                          "message": f"模型请求失败（{exc.response.status_code}）"})
+                          "message": message})
                 stats.status = "failed"
                 state["finished"] = True
                 return
@@ -674,7 +932,7 @@ class AgentRuntime:
             cached = _as_int(usage.get("cached_tokens"))
             reason_tok = _as_int(usage.get("reasoning_tokens"))
             total = _as_int(usage.get("total_tokens")) or (prompt + completion)
-            call_cost = _extract_cost({"usage": usage})
+            call_cost = _call_cost(cfg, usage)
             stats.prompt_tokens += prompt
             stats.completion_tokens += completion
             stats.cached_tokens += cached
@@ -837,18 +1095,35 @@ class AgentRuntime:
         async def _dispatch_at(i: int) -> ToolResult:
             tc, args, _err = parsed[i]
             name = tc["function"].get("name")
+            counts = repeat_state["counts"]
+            bumped = False
+            if not _batchable(name):
+                # A WRITE/META tool may change state (even a failed one may
+                # have mutated something before erroring): it invalidates
+                # "same call → same result" reasoning for every OTHER
+                # signature, so the epoch bump restarts their counters.
+                repeat_state["epoch"] += 1
+                bumped = True
             res = await self.registry.dispatch(name, args, ctx)
             if self.repeat_call_limit is not None:
                 # Stuck-model guard: the identical (tool, args) call issued
-                # yet again gets an inline nudge in its tool result, feeding
-                # self-correction instead of burning steps on retries that
-                # cannot return anything different.
+                # yet again — with no mutating tool in between — gets an
+                # inline nudge in its tool result, feeding self-correction
+                # instead of burning steps on retries that cannot return
+                # anything different.
                 sig = name + "\n" + json.dumps(args, sort_keys=True,
                                                ensure_ascii=False, default=str)
-                n = repeat_state.get(sig, 0) + 1
-                repeat_state[sig] = n
+                prev, epoch = counts.get(sig, (0, repeat_state["epoch"]))
+                if bumped or epoch == repeat_state["epoch"]:
+                    # `bumped`: a mutating tool's own retries still count —
+                    # re-sending an identical write is the stuck loop this
+                    # guard exists for, not a fresh observation.
+                    n = prev + 1
+                else:
+                    n = 1  # state changed since the last identical call
+                counts[sig] = (n, repeat_state["epoch"])
                 if n > self.repeat_call_limit:
-                    hint = (f"提示：这是本次运行中第 {n} 次以完全相同的参数调用 "
+                    hint = (f"提示：这是连续第 {n} 次以完全相同的参数调用 "
                             f"{name}。重复同样的调用大概率得到相同结果；请修改"
                             f"参数、更换工具，或基于已有结果换一种做法。")
                     res.content = f"{res.content}\n\n{hint}" if res.content else hint

@@ -1,5 +1,124 @@
 # Changelog
 
+## 0.9.17 (2026-10-02)
+
+The diagnosability round: a 400 that may stem from host-supplied vendor
+fields now says so, and provider presets move "which fields does this
+endpoint understand?" from every user to one maintained table.
+
+- **400s name the `extra_body` suspects** — strict gateways (OpenAI's API
+  among them) reject unknown request arguments with a plain 400; a lenient
+  one ignores them. When a request carried `LLMConfig.extra_body` and came
+  back 400, the raised `HTTPStatusError` now carries the field names, the
+  gateway's own error body (first 200 chars, where OpenAI-style 400s name
+  the offending argument), and a `lithe_hint` attribute that the runtime
+  appends to the run's error event — on all four paths (chat/responses ×
+  stream/non-stream; the Responses 400-degradation cascade still runs
+  first, unaffected). Without `extra_body` the error is byte-identical to
+  before.
+- **new `providers` bundle** — vendor presets as plain data:
+  `get_preset(name)` / `apply_preset(name, **overrides)` /
+  `known_providers()`, shipping openai / zai / deepseek / openrouter /
+  qwen / moonshot. Each preset carries only what is stable (base_url,
+  transport, safe-for-every-model notes on the vendor-specific knobs);
+  model-specific switches stay in `notes` instead of hard-coded
+  `extra_body`, because half the models behind an endpoint would break.
+  `apply_preset` merges preset-under-overrides (dict fields per key),
+  strips `notes`, skips `None` overrides, and never supplies credentials.
+  Unknown names raise with the known list. lithe-cli profiles consume this
+  via their `provider` field (see the lithe-cli 0.8.1 changelog).
+
+## 0.9.16 (2026-10-02)
+
+The P1 round: five host-ergonomics gaps in the zero-I/O core — vendor
+field/header passthrough, self-computed cost, enum + transform tool
+validation, multimodal fidelity on the Responses path, and a mid-run
+steering channel.
+
+- **`LLMConfig.extra_body` / `default_headers`** — vendor request fields the
+  kernel does not model (`top_p`, `seed`, `stop`, `response_format`,
+  `enable_thinking`, Responses `reasoning` effort, ...) now travel on every
+  call through both transports, stream and non-stream; gateway headers
+  (OpenRouter's `HTTP-Referer`/`X-Title`, `OpenAI-Organization`, ...) merge
+  over the bearer/JSON defaults. Internal keys (`tools`, `tool_choice`,
+  `max_tokens`, `model`, ...) win on collision — those knobs have
+  first-class config members, and a payload field must not silently break
+  the loop mechanics. Previously each of these meant a custom transport.
+- **`LLMConfig.pricing` makes `max_cost` real without gateway cost** —
+  OpenAI's API and many gateways never report `usage.cost`, so cost
+  accounting and the `max_cost` budget silently read 0 there. A
+  per-1M-token price table (`{"prompt", "completion", "cached_prompt"?}`,
+  validated at construction) computes each call's cost when the gateway is
+  silent; a reported cost still wins, and cached input defaults to the
+  prompt price (over-counting is the safe direction for a budget).
+- **`validate_args` checks top-level `enum`s** — the highest-value
+  self-correcting failure class after required/type: the model picking a
+  disallowed value now gets "只能取 [...] 之一" back as a failed tool
+  result listing every legal value, instead of executing with junk.
+- **`registry.add_transform(fn)`** — a new pre-*validation* argument hook,
+  `async (ctx, name, args) -> args`: canonicalize paths, inject defaults,
+  clamp sizes, redact secrets. Middlewares run after transforms and see the
+  rewritten args (still observe-or-veto); a transform returning a non-dict
+  is rejected as a failed tool result instead of smuggling junk into the
+  handler.
+- **Responses transport maps multimodal input instead of dropping it** —
+  `_messages_to_input` now translates `image_url` blocks (remote URL or
+  inline `data:` base64) to `input_image` items block-by-block; any block
+  it cannot express **raises** instead of silently degrading, which used to
+  have the model answer about an image it never saw. Plain-string content
+  keeps its byte-identical fast path. Side fix: `_message_size` counts
+  list-type (multimodal) content — text blocks by length, image blocks by
+  payload — where it previously counted 0, skewing the trim budget and the
+  chars-per-token calibration.
+- **Steering inbox — `AgentRuntime.run(..., inbox=...)`** (forwarded by
+  `AgentHost.run`): a queue of user texts (`asyncio.Queue` in-loop,
+  `queue.Queue` cross-thread) drained at each step boundary; each text
+  becomes a recorded, replayable user message announced via a
+  `user_injected` event, so "the user typed while the agent worked"
+  reaches the model on its next call. Precedence: stop and budgets are
+  checked first; the forced wrap-up step skips the drain (its tools are
+  withheld — an injected request could not be acted on) and unconsumed
+  items stay in the host's queue. The handle is stashed in
+  `ctx.shared["_runtime_inbox"]` for symmetry with `_runtime_stop`, but
+  subagent runtimes deliberately do not consume it — steering addresses
+  the orchestrator.
+
+## 0.9.15 (2026-10-02)
+
+The kernel-hardening release: three behavior-level fixes in the zero-I/O
+core — a process-global flag leaking between endpoints, a stuck-model guard
+that misfired on legitimate re-reads, and a context trimmer that gave up
+while the next request still overflowed the window.
+
+- **`ResponsesTransport` include-degradation memory is per instance** — the
+  "gateway 400-rejected-the-`include`-field" flag was a *class* attribute:
+  one gateway's 400 permanently disabled reasoning-include requests for
+  every other host and endpoint in the same process. It is now instance
+  state (mirroring `ChatCompletionsTransport._include_usage`); each runtime
+  owns its transport, so the memory still spans that runtime's runs without
+  cross-endpoint bleed.
+- **the identical-repeat nudge resets after a mutating tool** — `repeat_state`
+  counted every (tool, args) occurrence for the whole run, so a model doing
+  the correct read → edit → read → edit cycle on one file got "repeating the
+  same call" nudges from the 4th read on (the stale-file guard even demands
+  re-reads). Counters are now epoch-based: every WRITE/META dispatch bumps
+  the epoch and resets all read signatures — a read after a write is a fresh
+  observation. A mutating tool's *own* identical retries still count (that
+  re-send is exactly the stuck loop the guard exists for), and the nudge
+  text now says 连续 (consecutive).
+- **mid-run context trimming escalates to dropping old exchanges** — tier 1
+  (head+tail shrinking of old tool results) only shrinks tool messages, so
+  a conversation over budget because of long user/assistant prose or
+  protected-recent results went to the API anyway, overflowing the window.
+  Tier 2 now drops complete old exchanges (one assistant turn plus its tool
+  results, always as a unit, so pairing stays valid) oldest-first and
+  replaces them with a single omission note. System/user messages are never
+  dropped, the newest exchanges are protected, drops commit only when they
+  actually reach the budget (no losing history for nothing), the note stays
+  unique across passes, and a still-over-budget conversation logs a warning
+  instead of silently overflowing. Dropped turns remain in sinks/records —
+  only the live model context loses them.
+
 ## 0.9.14 (2026-10-02)
 
 The store-v2 release: the JSONL store learns what multi-session hosts

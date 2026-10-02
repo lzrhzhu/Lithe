@@ -320,6 +320,7 @@ class AgentHost:
         stats: dict | None = None,
         create_run: bool = True,
         stop=None,
+        inbox=None,
     ) -> AsyncIterator[dict]:
         run_id, user_id = ctx.run_id, ctx.user_id
         if create_run:
@@ -383,11 +384,12 @@ class AgentHost:
             )
             try:
                 # aclosing: a disconnecting consumer must deterministically
-                # close the runtime generator (and its HTTP client) instead
-                # of waiting for the GC finalizer.
+                # close the runtime generator (and its HTTP client) instead of
+                # waiting for the GC finalizer. `inbox` is the steering
+                # channel: a queue of user texts drained at each step boundary.
                 async with contextlib.aclosing(runtime.run(
-                        ctx, messages, tool_specs, stats=kstats, stop=stop)) \
-                        as stream:
+                        ctx, messages, tool_specs, stats=kstats, stop=stop,
+                        inbox=inbox)) as stream:
                     async for ev in stream:
                         yield ev
             except Exception as exc:  # noqa: BLE001

@@ -16,7 +16,7 @@ Layout:
 """
 # Single source of truth for the package version; pyproject reads it via
 # [tool.setuptools.dynamic] (statically, without importing this module).
-__version__ = "0.9.14"
+__version__ = "0.9.17"
 
 from lithe.actions import (  # noqa: F401
     Action, Reverter, UndoEngine, UndoReport,
@@ -40,6 +40,7 @@ from lithe.runtime import (  # noqa: F401
 )
 from lithe.tools import (  # noqa: F401
     ToolHandler, ToolMiddleware, ToolRegistry, ToolResult, ToolSpec,
+    ToolTransform,
 )
 from lithe.transports import (  # noqa: F401
     ChatCompletionsTransport, LLMTransport, ResponsesTransport, make_transport,
@@ -54,7 +55,7 @@ __all__ = [
     "MemoryProvider",
     "ResponsesTransport",
     "Reverter", "RunStats",
-    "ToolCategory", "ToolHandler", "ToolMiddleware",
+    "ToolCategory", "ToolHandler", "ToolMiddleware", "ToolTransform",
     "ToolRegistry", "ToolResult", "ToolSpec", "UndoEngine", "UndoReport",
     "bearer_headers", "categories_for", "chat_completion", "first_content",
     "make_transport", "register_mode",

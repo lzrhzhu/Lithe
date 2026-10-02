@@ -25,6 +25,9 @@ from lithe.bundles.mcp import (  # noqa: F401
 from lithe.bundles.patch import (  # noqa: F401
     register_apply_patch_tool,
 )
+from lithe.bundles.providers import (  # noqa: F401
+    PRESETS, apply_preset, get_preset, known_providers,
+)
 from lithe.bundles.sandbox import CodeRunner, register_code_tools  # noqa: F401
 from lithe.bundles.skills import (  # noqa: F401
     PACKAGE_FILE, ROOT_PACKAGE, SKILL_MAIN, RemoteSkillSource, SkillLibrary,
@@ -46,13 +49,14 @@ from lithe.bundles.workspace import Workspace, register_file_tools  # noqa: F401
 __all__ = [
     "AgentHost", "BlobStore", "CodeRunner", "CommandRunner", "ConversationStore",
     "DictToolAdapter", "JsonTodoStore", "JsonlRunStore", "MCPManager",
-    "MCPServerConfig", "RunStore",
+    "MCPServerConfig", "PRESETS", "RunStore",
     "PACKAGE_FILE", "ROOT_PACKAGE", "SKILL_MAIN", "RemoteSkillSource",
     "SkillLibrary", "SkillPackages", "StoreSink", "StoredAction",
     "StoredMessage", "StoredRun",
     "SubagentEngine", "SubagentRoster", "SubagentSpec", "TodoStore",
     "ToolPackage", "Workspace",
-    "assemble_messages", "check_packages", "list_tool_packages_admin",
+    "apply_preset", "assemble_messages", "check_packages",
+    "get_preset", "known_providers", "list_tool_packages_admin",
     "list_tools_admin", "make_delegate_tool", "make_parallel_delegate_tool",
     "package_meta", "package_of", "parse_servers", "register_apply_patch_tool",
     "register_code_tools", "register_command_tools", "register_download_tools",

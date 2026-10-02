@@ -45,6 +45,11 @@ class EventType:
     ERROR = "error"
     # The run was cancelled through its ``stop`` handle before finishing.
     CANCELLED = "cancelled"
+    # A host-queued user message injected at a step boundary while the run
+    # was in flight (the steering channel: the user typed while the agent
+    # worked). The text also enters `messages` and the record channel like
+    # any user turn, so replay and persistence see it in order.
+    USER_INJECTED = "user_injected"
 
 
 # An event is an ordinary dict carrying a ``type`` tag plus arbitrary fields.
