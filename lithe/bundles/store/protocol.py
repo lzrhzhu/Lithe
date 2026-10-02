@@ -58,7 +58,14 @@ class StoredAction:
 
 @dataclass
 class StoredRun:
-    """One agent run (one turn of a conversation)."""
+    """One agent run (one turn of a conversation).
+
+    ``created_at`` / ``finished_at`` are unix epoch floats (the store stamps
+    them automatically; legacy rows read back as ``None``). The token fields
+    are the run's cumulative usage as reported by the final ``done`` state —
+    ``None`` when the writer predates token persistence or the run never
+    finished, so a summary can distinguish "zero tokens" from "unknown".
+    """
 
     run_id: str
     user_id: str
@@ -70,6 +77,11 @@ class StoredRun:
     steps: int = 0
     cost: float = 0.0
     created_at: float | None = None
+    finished_at: float | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    cached_tokens: int | None = None
+    total_tokens: int | None = None
 
 
 class RunStore(Protocol):
@@ -89,10 +101,22 @@ class RunStore(Protocol):
         *,
         conversation_id: int | None = None,
         model: str | None = None,
+        created_at: float | None = None,
     ) -> None: ...
 
     def finish_run(
-        self, run_id: str, status: str, steps: int, cost: float, final: str | None
+        self,
+        run_id: str,
+        status: str,
+        steps: int,
+        cost: float,
+        final: str | None,
+        *,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        cached_tokens: int | None = None,
+        total_tokens: int | None = None,
+        finished_at: float | None = None,
     ) -> None: ...
 
     def get_run(self, run_id: str, user_id: str) -> StoredRun | None: ...
@@ -153,9 +177,14 @@ class ConversationStore(Protocol):
 
     Hosts that only need single-shot runs may implement :class:`RunStore` alone.
     Hosts with multi-turn conversations group runs under a conversation id.
+
+    A conversation row is ``{"id", "user_id", "title", "meta"}`` where ``meta``
+    is a free-form host-owned dict (e.g. workspace, pinned profile/model).
     """
 
-    def create_conversation(self, user_id: str, title: str) -> dict: ...
+    def create_conversation(
+        self, user_id: str, title: str, *, meta: dict | None = None
+    ) -> dict: ...
 
     def get_conversation(self, conversation_id: int, user_id: str) -> dict | None: ...
 
@@ -165,11 +194,23 @@ class ConversationStore(Protocol):
         self, conversation_id: int, user_id: str, title: str
     ) -> None: ...
 
+    def update_conversation_meta(
+        self, conversation_id: int, user_id: str, meta: dict
+    ) -> int: ...
+
     def delete_conversation(self, conversation_id: int, user_id: str) -> int: ...
 
     def runs_for_conversation(
         self, conversation_id: int, user_id: str
     ) -> list[StoredRun]: ...
+
+    def conversation_summaries(
+        self, user_id: str, limit: int = 40
+    ) -> list[dict]: ...
+
+    def messages_for_conversation(
+        self, conversation_id: int, user_id: str, *, exclude_subagent: bool = True
+    ) -> list[dict]: ...
 
 
 class BlobStore(Protocol):

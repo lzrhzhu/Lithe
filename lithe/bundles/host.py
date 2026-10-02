@@ -285,6 +285,10 @@ class AgentHost:
             kstats.last_step,
             kstats.total_cost,
             kstats.final_text or None,
+            prompt_tokens=kstats.prompt_tokens or None,
+            completion_tokens=kstats.completion_tokens or None,
+            cached_tokens=kstats.cached_tokens or None,
+            total_tokens=kstats.total_tokens or None,
         )
         if stats is not None:
             stats.update(

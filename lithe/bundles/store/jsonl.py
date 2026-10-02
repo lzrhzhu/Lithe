@@ -9,7 +9,7 @@ host never crosses users.
 
 Line discriminators: each JSONL line carries a ``kind`` tag naming its stream
 (``run`` / ``run_final`` / ``message`` / ``action`` / ``action_status`` /
-conversation base / ``rename`` / ``delete``). A mutation's *domain* kind
+conversation base / ``rename`` / ``meta`` / ``delete``). A mutation's *domain* kind
 (``file_write`` / ``guidance`` / ...) is stored under ``mkind`` to avoid
 colliding with the line discriminator.
 
@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 from lithe.bundles.store.protocol import (
@@ -118,7 +119,7 @@ class JsonlRunStore:
         return self._known_run_ids
 
     def create_run(self, run_id, user_id, task, *, conversation_id=None,
-                   model=None) -> None:
+                    model=None, created_at=None) -> None:
         known = self._all_run_ids()
         if run_id in known:
             # Duplicate ids corrupt the fold (one StoredRun chimera, doubled
@@ -130,13 +131,24 @@ class JsonlRunStore:
                                   "user_id": user_id,
                                   "conversation_id": conversation_id,
                                   "task": task, "status": "running",
-                                  "model": model})
+                                  "model": model,
+                                  "created_at": created_at or time.time()})
         known.add(run_id)
 
-    def finish_run(self, run_id, status, steps, cost, final) -> None:
+    def finish_run(self, run_id, status, steps, cost, final, *,
+                   prompt_tokens=None, completion_tokens=None,
+                   cached_tokens=None, total_tokens=None,
+                   finished_at=None) -> None:
+        """Close a run; token fields are optional and additive (legacy rows
+        written without them read back as ``None`` — "unknown", not zero)."""
         self._append(self._runs, {"kind": "run_final", "run_id": run_id,
                                   "status": status, "steps": steps,
-                                  "cost": cost, "final": final})
+                                  "cost": cost, "final": final,
+                                  "prompt_tokens": prompt_tokens,
+                                  "completion_tokens": completion_tokens,
+                                  "cached_tokens": cached_tokens,
+                                  "total_tokens": total_tokens,
+                                  "finished_at": finished_at or time.time()})
 
     def _fold_runs(self, user_id):
         """Return ``(by_id, order)`` of StoredRun for *user_id*, newest state wins.
@@ -156,7 +168,8 @@ class JsonlRunStore:
                 by_id[rid] = StoredRun(run_id=rid, user_id=user_id,
                                        task=ln.get("task", ""), status="running",
                                        conversation_id=ln.get("conversation_id"),
-                                       model=ln.get("model"))
+                                       model=ln.get("model"),
+                                       created_at=ln.get("created_at"))
                 if rid not in order:  # legacy duplicate headers list once
                     order.append(rid)
             elif kind == "run_final" and rid in by_id:
@@ -165,6 +178,15 @@ class JsonlRunStore:
                 r.steps = ln.get("steps", 0)
                 r.cost = ln.get("cost", 0.0)
                 r.final = ln.get("final")
+                # Optional fields: only overwrite when the final line carries
+                # them, so a legacy finish never clobbers stamped values with
+                # None and a tokenless finish stays honestly None.
+                if ln.get("finished_at") is not None:
+                    r.finished_at = ln["finished_at"]
+                for f in ("prompt_tokens", "completion_tokens",
+                          "cached_tokens", "total_tokens"):
+                    if ln.get(f) is not None:
+                        setattr(r, f, ln[f])
         return by_id, order
 
     def get_run(self, run_id, user_id) -> StoredRun | None:
@@ -320,13 +342,22 @@ class JsonlRunStore:
                     by_id[cid]["title"] = ln.get("title", by_id[cid].get("title"))
             elif k == "delete":
                 deleted.add(cid)
+            elif k == "meta":
+                if cid in by_id:
+                    by_id[cid].setdefault("meta", {})
+                    by_id[cid]["meta"].update(ln.get("meta") or {})
             elif k is None and cid is not None:
                 if cid not in by_id and ln.get("user_id") == user_id:
-                    by_id[cid] = dict(ln)
+                    conv = dict(ln)
+                    if conv.get("meta"):
+                        conv["meta"] = dict(conv["meta"])
+                    else:
+                        conv["meta"] = {}
+                    by_id[cid] = conv
                     order.append(cid)
         return [by_id[c] for c in order if c not in deleted]
 
-    def create_conversation(self, user_id, title) -> dict:
+    def create_conversation(self, user_id, title, *, meta=None) -> dict:
         if self._next_conversation_id is None:
             all_rows = self._read(self._conversations)
             self._next_conversation_id = max(
@@ -334,9 +365,10 @@ class JsonlRunStore:
                 default=0) + 1
         next_id = self._next_conversation_id
         self._next_conversation_id += 1
-        conv = {"id": next_id, "user_id": user_id, "title": title}
+        conv = {"id": next_id, "user_id": user_id, "title": title,
+                "meta": dict(meta or {})}
         self._append(self._conversations, conv)
-        return conv
+        return dict(conv)
 
     def get_conversation(self, conversation_id, user_id) -> dict | None:
         for c in self._fold_conversations(user_id):
@@ -360,9 +392,72 @@ class JsonlRunStore:
                      {"kind": "delete", "id": conversation_id})
         return 1
 
+    def update_conversation_meta(self, conversation_id, user_id, meta) -> int:
+        """Merge *meta* into a conversation's host-owned metadata dict."""
+        if self.get_conversation(conversation_id, user_id) is None:
+            return 0
+        self._append(self._conversations,
+                     {"kind": "meta", "id": conversation_id,
+                      "meta": dict(meta or {})})
+        return 1
+
     def runs_for_conversation(self, conversation_id, user_id) -> list[StoredRun]:
         return [r for r in self.list_runs(user_id, limit=_NO_LIMIT)
                 if r.conversation_id == conversation_id]
+
+    def conversation_summaries(self, user_id, limit=40) -> list[dict]:
+        """One aggregated row per conversation, newest activity first.
+
+        Activity ordering uses the last run's ``finished_at``/``created_at``
+        when present and falls back to file order for legacy rows, so a
+        summary list needs no timestamps of its own. Token totals sum the
+        runs that reported them (``None`` on legacy/unfinished runs means
+        those runs contribute nothing, not zero-cost knowledge).
+        """
+        runs = self.list_runs(user_id, limit=_NO_LIMIT)
+        by_conv: dict[int, list[StoredRun]] = {}
+        for r in runs:
+            if r.conversation_id is not None:
+                by_conv.setdefault(r.conversation_id, []).append(r)
+        summaries = []
+        for conv in self._fold_conversations(user_id):
+            rs = by_conv.get(conv["id"], [])
+            last = rs[-1] if rs else None
+
+            def _sum(field, rs=rs):
+                vals = [getattr(r, field) for r in rs
+                        if getattr(r, field) is not None]
+                return sum(vals) if vals else None
+
+            summaries.append({
+                "id": conv["id"],
+                "title": conv.get("title", ""),
+                "meta": dict(conv.get("meta") or {}),
+                "n_runs": len(rs),
+                "last_status": last.status if last else None,
+                "last_task": last.task if last else None,
+                "last_model": last.model if last else None,
+                "updated_at": (last.finished_at or last.created_at) if last
+                              else None,
+                "total_cost": sum(r.cost for r in rs) if rs else 0.0,
+                "prompt_tokens": _sum("prompt_tokens"),
+                "completion_tokens": _sum("completion_tokens"),
+                "cached_tokens": _sum("cached_tokens"),
+                "total_tokens": _sum("total_tokens"),
+            })
+        # Newest activity first; stamped rows by time, legacy (unstamped)
+        # rows keep file order after them — insertion scale is host-small.
+        stamped = [s for s in summaries if s["updated_at"] is not None]
+        unstamped = [s for s in summaries if s["updated_at"] is None]
+        stamped.sort(key=lambda s: s["updated_at"], reverse=True)
+        return (stamped + unstamped)[:limit]
+
+    def messages_for_conversation(self, conversation_id, user_id, *,
+                                  exclude_subagent=True) -> list[dict]:
+        rids = [r.run_id for r in
+                self.runs_for_conversation(conversation_id, user_id)]
+        return self._msg_rows(rids, user_id,
+                              exclude_subagent=exclude_subagent)
 
     # -- blobs ----------------------------------------------------------------
     # Honest refs are always "sha256:" + exactly 64 lowercase hex chars; the

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.9.14 (2026-10-02)
+
+The store-v2 release: the JSONL store learns what multi-session hosts
+(lithe-cli's workbench) need — time, tokens, conversation metadata — all
+additive, all backward compatible.
+
+- **run timestamps** — `create_run` stamps `created_at` and `finish_run`
+  stamps `finished_at` (unix floats, overridable for tests). Legacy rows
+  read back as `None`, never a fabricated zero.
+- **token persistence** — `finish_run` accepts optional
+  `prompt_tokens` / `completion_tokens` / `cached_tokens` /
+  `total_tokens` and `AgentHost._close_run` forwards the run's
+  `RunStats` totals, so a resumed session can reconstruct its
+  cumulative usage. Unknown (legacy, or a transport that reports no
+  usage) stays `None` — "unknown", not "zero".
+- **conversation metadata** — `create_conversation` takes a `meta`
+  dict (workspace, pinned profile/model, …) and the new
+  `update_conversation_meta` merges patches append-only; the fold
+  survives reopens.
+- **conversation summaries** — `conversation_summaries(user_id)`
+  returns one aggregated row per conversation (title, meta, run count,
+  last status/task/model, updated_at, cost + token totals), newest
+  activity first, falling back to file order for legacy unstamped rows.
+- **`messages_for_conversation`** — the store-side join hosts used to
+  hand-roll (`runs_for_conversation` → `messages_for_runs`).
+
 ## 0.9.12 (2026-10-01)
 
 The Windows release: `run_code` works outside POSIX for the first time.
