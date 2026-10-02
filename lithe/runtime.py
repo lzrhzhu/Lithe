@@ -270,6 +270,17 @@ class LLMConfig:
     gateway-reported cost always wins over the computed one; cached input
     is billed at ``cached_prompt`` when given, else at the ``prompt`` price
     (over-counting is the safe direction for a budget).
+
+    ``reasoning_effort`` is the vendor reasoning-intensity knob
+    (``"minimal"`` / ``"low"`` / ``"medium"`` / ``"high"`` — model
+    dependent). The value passes through *verbatim*: the chat transport
+    sends it as OpenAI-style top-level ``reasoning_effort``, the Responses
+    transport as ``reasoning: {"effort": ...}``, deep-merged with any
+    ``extra_body["reasoning"]`` keys (internal wins per key, so a host can
+    still add ``max_tokens``/``exclude`` alongside). ``None`` sends
+    nothing. Which values a model actually accepts is the endpoint's call —
+    an unsupported value surfaces through the 400 diagnostics instead of
+    silent mangling.
     """
     model: str
     base_url: str
@@ -285,6 +296,7 @@ class LLMConfig:
     max_tokens: int | None = None
     reasoning_replay: bool = True
     reasoning_scope: str = "loop"
+    reasoning_effort: str | None = None
     extra_body: dict | None = None
     default_headers: dict | None = None
     pricing: dict[str, float] | None = None
@@ -855,6 +867,7 @@ class AgentRuntime:
                         sleep_err=cfg.sleep_err,
                         include_reasoning=cfg.reasoning_replay,
                         reasoning_scope=cfg.reasoning_scope,
+                        reasoning_effort=cfg.reasoning_effort,
                         extra_body=cfg.extra_body,
                         extra_headers=cfg.default_headers)
                     # aclosing: a cancellation (or a mid-stream failure) must
@@ -889,6 +902,7 @@ class AgentRuntime:
                         sleep_err=cfg.sleep_err,
                         include_reasoning=cfg.reasoning_replay,
                         reasoning_scope=cfg.reasoning_scope,
+                        reasoning_effort=cfg.reasoning_effort,
                         extra_body=cfg.extra_body,
                         extra_headers=cfg.default_headers,
                     )

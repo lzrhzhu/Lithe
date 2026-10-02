@@ -67,6 +67,7 @@ class LLMTransport(Protocol):
         temperature: float | None = None, attempts: int = 1,
         sleep_429: float = 0.0, sleep_err: float = 0.0,
         include_reasoning: bool = True, reasoning_scope: str = "loop",
+        reasoning_effort: str | None = None,
         extra_body: dict | None = None, extra_headers: dict | None = None,
     ) -> TransportResult: ...
 
@@ -142,15 +143,26 @@ def _merge_extra(extra_body: dict | None, internal: dict) -> dict:
 
     ``extra_body`` (e.g. ``LLMConfig.extra_body``) carries vendor extensions
     the kernel does not model (``top_p``, ``seed``, ``enable_thinking``,
-    ``reasoning`` effort, ...). Internal keys (``tools``, ``tool_choice``,
-    ``max_tokens`` / ``max_output_tokens``, ...) win on collision: the loop
-    mechanics must not be silently broken by a payload field, and those knobs
-    have first-class ``LLMConfig`` members already.
+    ``reasoning`` budget fields, ...). Internal keys (``tools``,
+    ``tool_choice``, ``max_tokens`` / ``max_output_tokens``, ...) win on
+    collision: the loop mechanics must not be silently broken by a payload
+    field, and those knobs have first-class ``LLMConfig`` members already.
+
+    Dict-vs-dict collisions merge **per key** (internal still winning each
+    key): the Responses transport emits ``reasoning: {"effort": ...}`` while
+    a host's ``extra_body["reasoning"]`` may carry sibling keys
+    (``max_tokens``, ``exclude``) — a shallow update would drop them.
     """
     if not extra_body:
         return internal
     merged = dict(extra_body)
-    merged.update(internal)
+    for key, val in internal.items():
+        if isinstance(val, dict) and isinstance(merged.get(key), dict):
+            combined = dict(merged[key])
+            combined.update(val)
+            merged[key] = combined
+        else:
+            merged[key] = val
     return merged
 
 
@@ -207,7 +219,8 @@ class ChatCompletionsTransport:
         # rejection of `stream_options`, so later streamed calls omit it.
         self._include_usage = True
 
-    def _payload_extra(self, tools, tool_choice, max_tokens, temperature) -> dict:
+    def _payload_extra(self, tools, tool_choice, max_tokens, temperature,
+                       reasoning_effort=None) -> dict:
         extra: dict[str, Any] = {}
         if tools:
             extra["tools"] = tools
@@ -219,6 +232,11 @@ class ChatCompletionsTransport:
             extra["max_tokens"] = max_tokens
         if temperature is not None:
             extra["temperature"] = temperature
+        if reasoning_effort is not None:
+            # OpenAI chat-completions spelling; OpenRouter-style gateways
+            # that only speak `reasoning.effort` take it via extra_body
+            # (and a rejection surfaces through the 400 diagnostics).
+            extra["reasoning_effort"] = reasoning_effort
         return extra
 
     @staticmethod
@@ -239,7 +257,8 @@ class ChatCompletionsTransport:
         self, client, *, base_url, api_key, model, messages,
         tools=None, tool_choice=None, max_tokens=None, temperature=None,
         attempts=1, sleep_429=0.0, sleep_err=0.0, include_reasoning=True,
-        reasoning_scope="loop", extra_body=None, extra_headers=None,
+        reasoning_scope="loop", reasoning_effort=None,
+        extra_body=None, extra_headers=None,
     ) -> TransportResult:
         # include_reasoning / reasoning_scope are no-ops here: chat-completions
         # reasoning (DeepSeek-style reasoning_content / <think>) is per-turn
@@ -247,7 +266,8 @@ class ChatCompletionsTransport:
         # items are the only pass-back flavor.
         payload_extra = _merge_extra(
             extra_body,
-            self._payload_extra(tools, tool_choice, max_tokens, temperature))
+            self._payload_extra(tools, tool_choice, max_tokens, temperature,
+                                reasoning_effort))
         data = await chat_completion(
             client, base_url=base_url, api_key=api_key, model=model,
             messages=messages, payload_extra=payload_extra or None,
@@ -261,7 +281,8 @@ class ChatCompletionsTransport:
         self, client, *, base_url, api_key, model, messages,
         tools=None, tool_choice=None, max_tokens=None, temperature=None,
         attempts=1, sleep_429=0.0, sleep_err=0.0, include_reasoning=True,
-        reasoning_scope="loop", extra_body=None, extra_headers=None,
+        reasoning_scope="loop", reasoning_effort=None,
+        extra_body=None, extra_headers=None,
     ) -> AsyncIterator[dict]:
         """Streamed variant of :meth:`complete`.
 
@@ -272,7 +293,8 @@ class ChatCompletionsTransport:
         """
         extra = _merge_extra(
             extra_body,
-            self._payload_extra(tools, tool_choice, max_tokens, temperature))
+            self._payload_extra(tools, tool_choice, max_tokens, temperature,
+                                reasoning_effort))
         if self._include_usage:
             extra = {**extra, "stream_options": {"include_usage": True}}
         try:
@@ -577,7 +599,8 @@ class ResponsesTransport:
 
     def _payload(self, messages, tools, tool_choice, max_tokens, temperature,
                  *, stream: bool, include_reasoning: bool,
-                 reasoning_scope: str) -> dict:
+                 reasoning_scope: str, reasoning_effort: str | None = None,
+                 ) -> dict:
         instructions, input_items = _messages_to_input(
             messages, include_reasoning=include_reasoning,
             reasoning_scope=reasoning_scope)
@@ -590,6 +613,10 @@ class ResponsesTransport:
             payload["instructions"] = instructions
         if max_tokens is not None:
             payload["max_output_tokens"] = max_tokens
+        if reasoning_effort is not None:
+            # Responses-API spelling; _merge_extra deep-merges sibling keys
+            # (max_tokens / exclude) from extra_body["reasoning"].
+            payload["reasoning"] = {"effort": reasoning_effort}
         if tools:
             payload["tools"] = _convert_tools(tools)
             tc = _convert_tool_choice(tool_choice)
@@ -606,7 +633,7 @@ class ResponsesTransport:
         self, client, *, base_url, api_key, model, messages, tools,
         tool_choice, max_tokens, temperature, attempts, sleep_429,
         sleep_err, include_reasoning, reasoning_scope,
-        extra_body=None, extra_headers=None,
+        reasoning_effort=None, extra_body=None, extra_headers=None,
     ):
         """Non-stream call with the 400-degradation cascade (see class doc)."""
         want_reasoning = include_reasoning
@@ -614,7 +641,8 @@ class ResponsesTransport:
             payload = self._payload(messages, tools, tool_choice, max_tokens,
                                     temperature, stream=False,
                                     include_reasoning=want_reasoning,
-                                    reasoning_scope=reasoning_scope)
+                                    reasoning_scope=reasoning_scope,
+                                    reasoning_effort=reasoning_effort)
             payload = _merge_extra(extra_body, payload)
             payload["model"] = model
             if include_reasoning and self._include_reasoning:
@@ -650,7 +678,8 @@ class ResponsesTransport:
         self, client, *, base_url, api_key, model, messages,
         tools=None, tool_choice=None, max_tokens=None, temperature=None,
         attempts=1, sleep_429=0.0, sleep_err=0.0, include_reasoning=True,
-        reasoning_scope="loop", extra_body=None, extra_headers=None,
+        reasoning_scope="loop", reasoning_effort=None,
+        extra_body=None, extra_headers=None,
     ) -> TransportResult:
         data = await self._complete_with_fallback(
             client, base_url=base_url, api_key=api_key, model=model,
@@ -659,6 +688,7 @@ class ResponsesTransport:
             attempts=attempts, sleep_429=sleep_429, sleep_err=sleep_err,
             include_reasoning=include_reasoning,
             reasoning_scope=reasoning_scope,
+            reasoning_effort=reasoning_effort,
             extra_body=extra_body, extra_headers=extra_headers)
         return _parse_output(data)
 
@@ -743,7 +773,8 @@ class ResponsesTransport:
         self, client, *, base_url, api_key, model, messages,
         tools=None, tool_choice=None, max_tokens=None, temperature=None,
         attempts=1, sleep_429=0.0, sleep_err=0.0, include_reasoning=True,
-        reasoning_scope="loop", extra_body=None, extra_headers=None,
+        reasoning_scope="loop", reasoning_effort=None,
+        extra_body=None, extra_headers=None,
     ) -> AsyncIterator[dict]:
         """Streamed variant of :meth:`complete` over the Responses API.
 
@@ -761,7 +792,8 @@ class ResponsesTransport:
             payload = self._payload(messages, tools, tool_choice, max_tokens,
                                     temperature, stream=True,
                                     include_reasoning=want_reasoning,
-                                    reasoning_scope=reasoning_scope)
+                                    reasoning_scope=reasoning_scope,
+                                    reasoning_effort=reasoning_effort)
             payload = _merge_extra(extra_body, payload)
             payload["model"] = model
             if include_reasoning and self._include_reasoning:

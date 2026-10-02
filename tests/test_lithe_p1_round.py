@@ -462,6 +462,64 @@ async def test_runtime_error_event_carries_extra_body_hint():
     assert "seed" in err["message"] and "extra_body" in err["message"]
 
 
+# --- reasoning_effort: first-class knob, per-protocol emission ------------------
+
+async def test_chat_transport_emits_reasoning_effort():
+    client = _CaptureClient(
+        {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+    t = ChatCompletionsTransport()
+    await t.complete(client, base_url="http://gw", api_key="k", model="m",
+                     messages=[{"role": "user", "content": "hi"}],
+                     reasoning_effort="high")
+    assert client.posts[0]["json"]["reasoning_effort"] == "high"
+    # None → 字段不发
+    client2 = _CaptureClient(
+        {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+    await t.complete(client2, base_url="http://gw", api_key="k", model="m",
+                     messages=[{"role": "user", "content": "hi"}])
+    assert "reasoning_effort" not in client2.posts[0]["json"]
+
+
+async def test_responses_transport_emits_reasoning_effort():
+    client = _CaptureClient(
+        {"output": [{"type": "message",
+                     "content": [{"type": "output_text", "text": "ok"}]}]})
+    t = ResponsesTransport()
+    await t.complete(client, base_url="https://gw/responses", api_key="k",
+                     model="m", messages=[{"role": "user", "content": "hi"}],
+                     reasoning_effort="low")
+    assert client.posts[0]["json"]["reasoning"] == {"effort": "low"}
+
+
+async def test_reasoning_deep_merge_keeps_extra_body_siblings():
+    """extra_body["reasoning"] 的兄弟键（max_tokens/exclude）不被内部
+    {"effort": ...} 浅合并吞掉；同键内部优先。"""
+    client = _CaptureClient(
+        {"output": [{"type": "message",
+                     "content": [{"type": "output_text", "text": "ok"}]}]})
+    t = ResponsesTransport()
+    await t.complete(client, base_url="https://gw/responses", api_key="k",
+                     model="m", messages=[{"role": "user", "content": "hi"}],
+                     reasoning_effort="high",
+                     extra_body={"reasoning": {"max_tokens": 4000,
+                                               "exclude": True,
+                                               "effort": "low"}})
+    r = client.posts[0]["json"]["reasoning"]
+    assert r == {"effort": "high", "max_tokens": 4000, "exclude": True}, \
+        "兄弟键保留，effort 内部优先"
+
+
+async def test_runtime_forwards_reasoning_effort():
+    reg = ToolRegistry()
+    transport = _KwTransport([{"content": "ok"}])
+    rt = AgentRuntime(reg, LLMConfig(model="m", base_url="x", api_key="k",
+                                     transport=transport,
+                                     reasoning_effort="medium"))
+    ctx = AgentContext(run_id="r", user_id="u")
+    _ = [e async for e in rt.run(ctx, [{"role": "user", "content": "hi"}], [])]
+    assert transport.calls[0]["reasoning_effort"] == "medium"
+
+
 # --- P1-2: pricing ---------------------------------------------------------------
 
 async def test_pricing_computes_cost_when_gateway_silent():

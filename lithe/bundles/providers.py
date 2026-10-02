@@ -63,7 +63,10 @@ PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://openrouter.ai/api/v1",
         "transport": "chat",
         "notes": "归因头 HTTP-Referer / X-Title 经 default_headers 自带值设置；"
-                 "路由（route/provider 等字段）与用量统计字段按需经 extra_body。",
+                 "路由（route/provider 等字段）与用量统计字段按需经 extra_body。"
+                 "推理强度经 extra_body 的 reasoning 对象（如 "
+                 '{"reasoning": {"effort": "high"}}，预算制模型可用 '
+                 "max_tokens）；模型能力见 /models 的 supported_parameters。",
     },
     "qwen": {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",

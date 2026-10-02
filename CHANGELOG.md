@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.18 (2026-10-02)
+
+The reasoning-effort release: a first-class intensity knob for reasoning
+models, mapped per protocol and safe to combine with vendor budget fields.
+
+- **`LLMConfig.reasoning_effort`** — the vendor reasoning-intensity knob
+  (`minimal`/`low`/`medium`/`high`, model dependent), passed through
+  verbatim: the chat transport sends OpenAI-style top-level
+  `reasoning_effort`, the Responses transport sends
+  `reasoning: {"effort": ...}`. `None` (default) sends nothing; an
+  unsupported value surfaces through the 0.9.17 400 diagnostics instead of
+  silent mangling. Usage-side nothing changes: `reasoning_tokens` was
+  already normalized, accumulated and priced.
+- **`_merge_extra` deep-merges dict fields per key** — the Responses
+  transport's internal `reasoning: {"effort": ...}` no longer clobbers a
+  host's `extra_body["reasoning"]` siblings (`max_tokens` for budget-style
+  models, `exclude`, ...): dict-vs-dict collisions combine key-wise with
+  the internal value winning each key. The openrouter preset's notes now
+  spell out its `reasoning` object (effort/max_tokens/exclude) and the
+  `/models` `supported_parameters` capability source.
+
 ## 0.9.17 (2026-10-02)
 
 The diagnosability round: a 400 that may stem from host-supplied vendor
