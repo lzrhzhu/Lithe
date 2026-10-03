@@ -146,6 +146,11 @@ async def test_host_run_envelope_persistence_replay(tmp_path, monkeypatch):
     assert events[0]["type"] == EventType.RUN_START
     assert events[-1]["type"] == EventType.DONE
     assert events[-1]["status"] == "done"
+    # the host envelope reports the run's wall-clock length (frontends show
+    # "how long did this turn take" straight off the done event)
+    assert isinstance(events[-1]["duration_s"], float)
+    assert events[-1]["duration_s"] >= 0
+    assert stats["duration_s"] == events[-1]["duration_s"]
     assert state == {"a.txt": "hi"}
     assert stats["status"] == "done" and stats["final_text"] == "done"
 

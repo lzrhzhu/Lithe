@@ -318,6 +318,7 @@ class AgentHost:
                     "context_tokens": kstats.context_tokens,
                     "context_window": kstats.context_window,
                     "context_percent": kstats.context_percent,
+                    "duration_s": kstats.duration_s,
                 }
             )
 
@@ -458,6 +459,7 @@ class AgentHost:
             "context_tokens": kstats.context_tokens,
             "context_window": kstats.context_window,
             "context_percent": kstats.context_percent,
+            "duration_s": kstats.duration_s,
             "status": kstats.status,
         }
         if sub.get("delegations"):

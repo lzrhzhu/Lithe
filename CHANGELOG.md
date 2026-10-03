@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.22 (2026-10-03)
+
+A one-field follow-up to 0.9.20's observability round: the *host* run
+envelope now reports how long the run took.
+
+- **`duration_s` on the host DONE event** — `AgentRuntime` already stamped
+  `RunStats.duration_s` and its own envelope carried it, but `AgentHost`'s
+  richer DONE event (the one CLI-style hosts actually consume) omitted the
+  field, so frontends had to re-time turns themselves. The host DONE event
+  and the host `stats` dict now carry `duration_s` (wall-clock seconds of
+  the whole run, prompt assembly included).
+
 ## 0.9.21 (2026-10-03)
 
 A one-fix follow-up to the steering inbox (0.9.16): injected messages
