@@ -205,6 +205,21 @@ class StoreSink:
                     subagent=ctx.subagent,
                 )
             )
+        elif role == "user":
+            # Steering injections (runtime._loop_step drains the inbox at
+            # step boundaries): persist them like every other turn, so a
+            # resumed conversation shows why the model's course changed —
+            # the initial task row is written by the host directly and
+            # never passes through here, so there is no double record.
+            self.store.add_message(
+                StoredMessage(
+                    role="user",
+                    content=record.get("content"),
+                    run_id=ctx.run_id,
+                    user_id=ctx.user_id,
+                    subagent=ctx.subagent,
+                )
+            )
         elif role == "tool":
             self.store.add_message(
                 StoredMessage(

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.21 (2026-10-03)
+
+A one-fix follow-up to the steering inbox (0.9.16): injected messages
+are now actually persisted.
+
+- **StoreSink writes user rows** — `on_record` historically persisted
+  only assistant and tool records, so a steering injection's `_record`
+  call was silently dropped: the injected line vanished from the stored
+  conversation, and a resumed session replayed model answers referencing
+  an input that was no longer in the transcript. User records now land
+  like every other turn (the host writes the initial task row directly,
+  so nothing doubles). Caught by wiring the CLI's steering path against
+  the real store.
+
 ## 0.9.20 (2026-10-03)
 
 The hardening + observability round: an injected client can no longer

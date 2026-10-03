@@ -715,6 +715,40 @@ async def test_steering_inbox_injects_user_message():
     assert {"role": "user", "content": "别动 src/，只看 tests/"} in sink.records
 
 
+async def test_steering_user_row_persists_through_storesink(tmp_path):
+    """The injected line must survive persistence: StoreSink historically
+    dropped user records (only assistant/tool were written), so a resumed
+    conversation lost the very message that steered it."""
+    from lithe.bundles import AgentHost, JsonlRunStore
+    from lithe.bundles.host import StoreSink
+
+    reg = ToolRegistry()
+    inbox = asyncio.Queue()
+
+    async def echo_then_steer(ctx, args):
+        await inbox.put("改看 tests/")
+        return ToolResult(True, "echoed", "ok")
+
+    reg.register(ToolSpec("echo", "e", category=ToolCategory.READ),
+                 echo_then_steer)
+    store = JsonlRunStore(tmp_path)
+    host = AgentHost(reg, LLMConfig(model="m", base_url="x", api_key="k",
+                                    transport=_SnapTransport([
+                                        {"tool_calls": [_tc(cid="c1")]},
+                                        {"content": "done"},
+                                    ])), store, max_steps=4,
+                     build_system_prompt=lambda ctx, mode, anchor: "sys")
+    ctx = AgentContext(run_id="r", user_id="u")
+    _ = [e async for e in host.run(ctx, "任务", inbox=inbox)]
+    rows = store.messages_for_run("r", "u")
+    injected = [r for r in rows
+                if r.get("role") == "user" and r.get("content") == "改看 tests/"]
+    assert len(injected) == 1
+    # the host-written task row is not duplicated by the sink
+    assert sum(1 for r in rows if r.get("role") == "user") == 2
+    assert isinstance(StoreSink(store), StoreSink)  # import sanity
+
+
 async def test_steering_multiple_messages_preserve_order():
     reg = ToolRegistry()
     inbox = asyncio.Queue()
