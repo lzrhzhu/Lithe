@@ -281,6 +281,16 @@ class LLMConfig:
     nothing. Which values a model actually accepts is the endpoint's call —
     an unsupported value surfaces through the 400 diagnostics instead of
     silent mangling.
+
+    ``document_format`` is the document-content-block dialect this endpoint
+    family accepts (``"inline-file"`` / ``"files-api"`` / ``"none"`` —
+    see ``lithe.bundles.documents``). The tool loop itself ignores it:
+    documents never enter the main conversation. It is endpoint knowledge
+    the documents bundle reads off its perception ``LLMConfig``, so a
+    provider preset can contribute a default (provider type constrains the
+    format family) while a hand-written profile field or an explicit
+    registration argument overrides it — what matters is what the gateway
+    accepts, not what the URL looks like.
     """
     model: str
     base_url: str
@@ -300,6 +310,7 @@ class LLMConfig:
     extra_body: dict | None = None
     default_headers: dict | None = None
     pricing: dict[str, float] | None = None
+    document_format: str | None = None
 
     def __post_init__(self) -> None:
         if self.reasoning_scope not in ("loop", "conversation"):

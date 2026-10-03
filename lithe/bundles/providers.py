@@ -14,6 +14,14 @@ What a preset deliberately does and does not carry:
   appends ``/chat/completions``; ``responses`` presets carry the full
   endpoint URL instead, matching ``ResponsesTransport``).
 - ``transport`` — usually ``"chat"``; a ``"responses"`` preset names it.
+- ``document_format`` — the document-content-block *dialect* the endpoint
+  family accepts (see :mod:`lithe.bundles.documents`): ``"inline-file"``
+  (OpenRouter family, incl. self-built routers speaking its format behind
+  a custom ``base_url``), ``"files-api"`` (strict OpenAI chat-completions,
+  two-step upload), or ``"none"`` (the endpoint takes no document blocks).
+  Like every preset key it is a default under overrides — a profile's
+  ``document_format`` field wins, because what matters is what the
+  *gateway* accepts, not what the URL looks like.
 - ``extra_body`` / ``default_headers`` — only fields that are safe for
   *every* model behind that endpoint. Model-specific switches (Qwen's
   ``enable_thinking``, GLM's ``thinking`` object, OpenRouter routing) stay
@@ -35,49 +43,61 @@ from typing import Any
 
 # Keys that are LLMConfig fields vs. this module's own metadata.
 _PRESET_META_KEYS = ("notes",)
-_PRESET_CONFIG_KEYS = ("base_url", "transport", "extra_body",
-                       "default_headers", "pricing")
+_PRESET_CONFIG_KEYS = ("base_url", "transport", "document_format",
+                       "extra_body", "default_headers", "pricing")
 
 PRESETS: dict[str, dict[str, Any]] = {
     "openai": {
         "base_url": "https://api.openai.com/v1",
         "transport": "chat",
+        "document_format": "files-api",
         "notes": "官方端点对未知参数严格：extra_body 里只放确定支持的字段"
                  "（top_p/seed/response_format 等）。推理模型可改用 responses "
-                 "transport（base_url 需为完整 /responses 端点 URL）。",
+                 "transport（base_url 需为完整 /responses 端点 URL）。文档输入走"
+                 "files-api 两步上传（先 POST /files 拿 file_id 再引用块）。",
     },
     "zai": {
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "transport": "chat",
+        "document_format": "none",
         "notes": "智谱开放平台。GLM 思考模型的 thinking 开关（如 "
-                 '{"thinking": {"type": "enabled"}}）经 extra_body 按需开启；'
-                 "非思考模型不要带。",
+                  '{"thinking": {"type": "enabled"}}）经 extra_body 按需开启；'
+                  "非思考模型不要带。chat content 不收文档块，文档理解走"
+                  "run_code 提取文本。",
     },
     "deepseek": {
         "base_url": "https://api.deepseek.com",
         "transport": "chat",
+        "document_format": "none",
         "notes": "deepseek-reasoner 的 reasoning_content 是每轮状态，内核仅在"
-                 "显示层使用、不回传（chat 协议的既定行为），无需配置。",
+                  "显示层使用、不回传（chat 协议的既定行为），无需配置。"
+                  "chat content 不收文档块。",
     },
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "transport": "chat",
+        "document_format": "inline-file",
         "notes": "归因头 HTTP-Referer / X-Title 经 default_headers 自带值设置；"
-                 "路由（route/provider 等字段）与用量统计字段按需经 extra_body。"
-                 "推理强度经 extra_body 的 reasoning 对象（如 "
-                 '{"reasoning": {"effort": "high"}}，预算制模型可用 '
-                 "max_tokens）；模型能力见 /models 的 supported_parameters。",
+                  "路由（route/provider 等字段）与用量统计字段按需经 extra_body。"
+                  "推理强度经 extra_body 的 reasoning 对象（如 "
+                  '{"reasoning": {"effort": "high"}}，预算制模型可用 '
+                  "max_tokens）；模型能力见 /models 的 supported_parameters。"
+                  "文档输入用内联 file 块（filename + file_data data-URL），"
+                  "自建的同格式路由同样适用，只需改 base_url。",
     },
     "qwen": {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "transport": "chat",
+        "document_format": "none",
         "notes": "阿里云百炼 OpenAI 兼容模式。Qwen3 系列的 enable_thinking 等"
-                 "开关因模型而异，经 extra_body 按所用模型设置。",
+                  "开关因模型而异，经 extra_body 按所用模型设置。chat content "
+                  "不收文档块。",
     },
     "moonshot": {
         "base_url": "https://api.moonshot.cn/v1",
         "transport": "chat",
-        "notes": "Kimi 系列模型。",
+        "document_format": "none",
+        "notes": "Kimi 系列模型。chat content 不收文档块。",
     },
 }
 

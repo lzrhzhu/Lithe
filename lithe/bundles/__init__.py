@@ -13,6 +13,9 @@ from lithe.bundles.command import CommandRunner, register_command_tools  # noqa:
 from lithe.bundles.download import (  # noqa: F401
     register_download_tools,
 )
+from lithe.bundles.documents import (  # noqa: F401
+    register_document_tools,
+)
 from lithe.bundles.host import (  # noqa: F401
     AgentHost, DictToolAdapter, StoreSink, assemble_messages, undo_run,
 )
@@ -60,7 +63,8 @@ __all__ = [
     "list_tools_admin", "make_delegate_tool", "make_parallel_delegate_tool",
     "package_meta", "package_of", "parse_servers", "register_apply_patch_tool",
     "register_code_tools", "register_command_tools", "register_download_tools",
-    "register_delegate_tool", "register_delegate_tools", "register_file_tools",
+    "register_delegate_tool", "register_delegate_tools", "register_document_tools",
+    "register_file_tools",
     "register_image_tools", "register_skill_tool", "register_todo_tools",
     "tool_categories",
     "todos_block", "undo_run",

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.19 (2026-10-03)
+
+The document-perception round: models that read PDFs become reachable
+through the same tool-tier pattern as vision, with the wire dialect
+selected per endpoint family instead of guessed from the URL.
+
+- **new `documents` bundle** — `document_info` (a stdlib-only probe: PDF
+  magic + version + best-effort `/Type /Page` count, OOXML subtype via
+  the zip central directory with a name-suffix fallback) and
+  `analyze_document` (one chat call carrying the document as a content
+  block plus the question, memoized per file hash + question + format,
+  size-capped before reading, tool-level timeout). The document never
+  enters the main conversation — the kernel's context budget / trimming /
+  replay machinery is untouched, mirroring the images bundle.
+- **`document_format` dialects** — `inline-file` (one
+  `{"type": "file", "file": {"filename", "file_data": data-URL}}` block,
+  the OpenRouter family incl. self-built routers speaking its format
+  behind their own base_url), `files-api` (strict OpenAI two-step:
+  multipart upload to `/files` with purpose `user_data`, then a
+  `file_id` block), `none` (probe only). The format follows what the
+  *gateway* accepts, not what the URL looks like.
+- **`LLMConfig.document_format`** — endpoint knowledge the documents
+  bundle reads off its perception config; the tool loop itself ignores
+  it. Provider presets contribute each family's default (openai →
+  `files-api`, openrouter → `inline-file`, zai/deepseek/qwen/moonshot →
+  `none`), an explicit profile field or registration argument overrides,
+  and an unrecognized value raises at registration instead of surfacing
+  as a mystery 400 later.
+- **400 diagnostics for dialect mismatches** — an endpoint 400 on the
+  analyze call (or a failed `/files` upload) returns a tool result that
+  names `document_format` and the alternatives, the same
+  self-correcting philosophy as `extra_body_hint`.
+
 ## 0.9.18 (2026-10-02)
 
 The reasoning-effort release: a first-class intensity knob for reasoning
