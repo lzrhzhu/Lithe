@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any
 from collections.abc import Callable
@@ -253,28 +254,49 @@ class SubagentEngine:
         # the parent run also ends this subagent's loop (between its model
         # calls / tool dispatches) instead of letting it run to completion.
         parent_stop = parent_ctx.shared.get("_runtime_stop")
+        # Real-time parallel-budget visibility: this delegation registers a
+        # live-usage slot in the shared map; every usage event folds into it
+        # as the child spends. Each concurrently running sibling's runtime
+        # counts the OTHER slots against its own cap (see
+        # AgentRuntime._over_budget), so N parallel workers share one
+        # ceiling instead of each burning the full max_cost. The slot is
+        # keyed per delegation (not per subagent id) and popped at the end —
+        # sequential delegations keep their independent caps.
+        slot = f"{sub_id}:{uuid.uuid4().hex[:8]}"
+        sub_ctx.extra["_delegation_slot"] = slot
+        inflight = parent_ctx.shared.setdefault("_inflight_sub_usage", {})
+        inflight[slot] = {"cost": 0.0, "tokens": 0}
         # aclosing: a cancelled delegation must deterministically close the
         # inner runtime generator (its httpx client) instead of waiting for
         # the GC finalizer to notice.
-        async with contextlib.aclosing(runtime.run(
-                sub_ctx, messages,
-                self.trimmed_tools(spec, sub_ctx.disabled_tools),
-                stats=stats, stop=parent_stop)) as stream:
-            async for ev in stream:
-                # internal display events are recorded (tagged), not
-                # forwarded to the orchestrator's stream — except through
-                # the optional live progress hook, which a host wires to its
-                # own push channel.
-                if self.on_subagent_event is not None:
-                    thin = _thin_event(ev)
-                    if thin is not None:
-                        try:
-                            await self.on_subagent_event(
-                                sub_ctx, {"type": "subagent_progress",
-                                          "agent": sub_id, "event": thin})
-                        except Exception as exc:  # noqa: BLE001
-                            log.warning("subagent progress callback failed: %s",
-                                        exc)
+        try:
+            async with contextlib.aclosing(runtime.run(
+                    sub_ctx, messages,
+                    self.trimmed_tools(spec, sub_ctx.disabled_tools),
+                    stats=stats, stop=parent_stop)) as stream:
+                async for ev in stream:
+                    # internal display events are recorded (tagged), not
+                    # forwarded to the orchestrator's stream — except through
+                    # the optional live progress hook, which a host wires to
+                    # its own push channel.
+                    if ev.get("type") == "usage":
+                        live = inflight.get(slot)
+                        if live is not None:
+                            live["cost"] += float(ev.get("cost") or 0.0)
+                            live["tokens"] += int(ev.get("total_tokens") or 0)
+                    if self.on_subagent_event is not None:
+                        thin = _thin_event(ev)
+                        if thin is not None:
+                            try:
+                                await self.on_subagent_event(
+                                    sub_ctx, {"type": "subagent_progress",
+                                              "agent": sub_id, "event": thin})
+                            except Exception as exc:  # noqa: BLE001
+                                log.warning("subagent progress callback failed: %s",
+                                            exc)
+        finally:
+            inflight.pop(slot, None)
+            sub_ctx.extra.pop("_delegation_slot", None)
 
         # Fold this delegation's spend into the run-wide accumulator (shared
         # by reference with the orchestrator's context): without it, the

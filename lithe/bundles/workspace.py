@@ -44,6 +44,7 @@ _SEARCH_MAX_LINE = 10_000
 # Whole-scan wall budget; exceeded → honest partial result instead of a hang.
 _SEARCH_TIME_BUDGET = 10.0
 _SEARCH_YIELD_EVERY = 2000       # lines between event-loop yields
+_SEARCH_READ_BATCH = 16          # files per asyncio.to_thread read batch
 _MATCH_LINE_CAP = 200
 _GLOB_MAX_RESULTS = 200
 _DIFF_CAP = 2000
@@ -426,12 +427,16 @@ def register_file_tools(
             return ToolResult(False, "缺少 path", "缺少 path 参数。")
         ws = workspace_for(ctx)
         try:
-            content = ws.read(rel)
+            # Disk I/O runs off the event loop (asyncio.to_thread, the same
+            # policy as the images/documents bundles): one slow read on a
+            # cold/NFS workspace must not stall every concurrent agent run
+            # in the process.
+            content = await asyncio.to_thread(ws.read, rel)
         except FileNotFoundError:
             return ToolResult(False, "文件不存在", f"文件不存在：{rel}")
         except PermissionError as exc:
             return ToolResult(False, "非法路径", str(exc))
-        _record_revision(ctx, ws, rel)
+        await asyncio.to_thread(_record_revision, ctx, ws, rel)
         offset = args.get("offset")
         limit = args.get("limit")
         if offset is not None or limit is not None:
@@ -466,24 +471,29 @@ def register_file_tools(
         if not rel:
             return ToolResult(False, "缺少 path", "缺少 path 参数。")
         ws = workspace_for(ctx)
-        stale = _check_fresh(ctx, ws, rel)
+        stale = await asyncio.to_thread(_check_fresh, ctx, ws, rel)
         if stale is not None:
             return stale
-        guard = _check_run_growth(ctx, ws, [rel])
+        guard = await asyncio.to_thread(_check_run_growth, ctx, ws, [rel])
         if guard is not None:
             return guard
-        old = ws.read(rel) if ws.exists(rel) else None
+
+        def _read_old():
+            return ws.read(rel) if ws.exists(rel) else None
+
+        old = await asyncio.to_thread(_read_old)
         try:
-            ws.write(rel, content)
+            await asyncio.to_thread(ws.write, rel, content)
         except (PermissionError, ValueError, RuntimeError) as exc:
             return ToolResult(False, "写入失败", str(exc))
-        _record_revision(ctx, ws, rel)
+        await asyncio.to_thread(_record_revision, ctx, ws, rel)
         if old is None:
-            _note_created(ctx, ws, rel)
-        added, removed = _line_delta(old, content)
+            await asyncio.to_thread(_note_created, ctx, ws, rel)
+        added, removed = await asyncio.to_thread(_line_delta, old, content)
+        ui = await asyncio.to_thread(_file_change, "write", rel, old, content)
         return ToolResult(True, f"写入 {rel}{_delta_note(added, removed, created=old is None)}",
                           f"已写入 {rel}（{len(content)} 字符）。旧版本可撤销。",
-                          ui=[_file_change("write", rel, old, content)])
+                          ui=[ui])
 
     async def edit_file(ctx, args):
         rel = (args.get("path") or "").strip()
@@ -498,12 +508,12 @@ def register_file_tools(
             return ToolResult(False, "无变化", "old_text 与 new_text 相同，无需编辑。")
         ws = workspace_for(ctx)
         try:
-            content = ws.read(rel)
+            content = await asyncio.to_thread(ws.read, rel)
         except FileNotFoundError:
             return ToolResult(False, "文件不存在", f"文件不存在：{rel}")
         except PermissionError as exc:
             return ToolResult(False, "非法路径", str(exc))
-        stale = _check_fresh(ctx, ws, rel)
+        stale = await asyncio.to_thread(_check_fresh, ctx, ws, rel)
         if stale is not None:
             return stale
         count = content.count(old_text)
@@ -567,17 +577,19 @@ def register_file_tools(
                            else content.replace(old_text, new_text, 1))
             replaced = count if replace_all else 1
         try:
-            ws.write(rel, new_content)
+            await asyncio.to_thread(ws.write, rel, new_content)
         except (PermissionError, ValueError, RuntimeError) as exc:
             return ToolResult(False, "写入失败", str(exc))
-        _record_revision(ctx, ws, rel)
-        diff = _compact_diff(rel, content, new_content)
+        await asyncio.to_thread(_record_revision, ctx, ws, rel)
+        diff = await asyncio.to_thread(_compact_diff, rel, content, new_content)
         body = f"已替换 {rel} 中的指定文本（{replaced} 处）{fuzzy_note}。"
         if diff:
             body += "\n\n" + diff
-        added, removed = _line_delta(content, new_content)
+        added, removed = await asyncio.to_thread(_line_delta, content, new_content)
+        ui = await asyncio.to_thread(_file_change, "edit", rel, content,
+                                     new_content)
         return ToolResult(True, f"编辑 {rel}{_delta_note(added, removed)}", body,
-                          ui=[_file_change("edit", rel, content, new_content)])
+                          ui=[ui])
 
     async def search_files(ctx, args):
         pattern = (args.get("pattern") or "").strip()
@@ -591,10 +603,11 @@ def register_file_tools(
         name_pat = (args.get("glob") or "").strip()
         ws = workspace_for(ctx)
         try:
-            base = ws.safe_path(rel_dir) if rel_dir else ws.root
+            base = (await asyncio.to_thread(ws.safe_path, rel_dir)
+                    if rel_dir else ws.root)
         except PermissionError as exc:
             return ToolResult(False, "非法路径", str(exc))
-        if rel_dir and not base.is_dir():
+        if rel_dir and not await asyncio.to_thread(base.is_dir):
             return ToolResult(False, "目录不存在", f"目录不存在：{rel_dir}")
         prefix = rel_dir.rstrip("/") + "/" if rel_dir else ""
         matches: list[str] = []
@@ -602,40 +615,61 @@ def register_file_tools(
         deadline = time.monotonic() + _SEARCH_TIME_BUDGET
         scanned = skipped_binary = skipped_big = skipped_long = 0
         out_of_time = False
-        for rel, p in ws.walk():
-            if prefix and not rel.startswith(prefix):
-                continue
-            if name_pat and not (fnmatch.fnmatch(rel, name_pat)
-                                 or fnmatch.fnmatch(p.name, name_pat)):
-                continue
-            scanned += 1
+
+        def _collect():
+            # The walk itself is disk-bound (a full sorted rglob of the
+            # tree); filtering is pure Python and rides along for free.
+            return [(rel, p) for rel, p in ws.walk()
+                    if (not prefix or rel.startswith(prefix))
+                    and (not name_pat
+                         or fnmatch.fnmatch(rel, name_pat)
+                         or fnmatch.fnmatch(p.name, name_pat))]
+
+        def _read_entry(p: Path):
+            """(tag, text): 'big' / 'os' skip reasons, else file text."""
             try:
                 if p.stat().st_size > _SEARCH_MAX_FILE:
+                    return "big", None
+                return "", p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return "os", None
+
+        # The tree walk materializes off the loop (walk() sorts the whole
+        # rglob before yielding anything, so nothing is lost vs. lazy scan),
+        # then files are read in thread batches: a slow disk never stalls
+        # concurrent runs, and the awaits between batches keep the tool
+        # timeout responsive.
+        entries = await asyncio.to_thread(_collect)
+        scanned = len(entries)
+        for start in range(0, len(entries), _SEARCH_READ_BATCH):
+            batch = entries[start:start + _SEARCH_READ_BATCH]
+            texts = await asyncio.gather(
+                *[asyncio.to_thread(_read_entry, p) for _, p in batch])
+            for (rel, _p), (tag, text) in zip(batch, texts, strict=True):
+                if tag == "big":
                     skipped_big += 1
                     continue
-                text = p.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            if "\x00" in text[:1024]:
-                skipped_binary += 1
-                continue
-            # Periodically yield to the loop (and check the clock): without
-            # an await in the handler, neither the tool timeout nor anything
-            # else on the loop could run while we grind through a big tree.
-            for lineno, line in enumerate(text.splitlines(), 1):
-                if (lineno % _SEARCH_YIELD_EVERY == 0
-                        and time.monotonic() > deadline):
-                    out_of_time = True
-                    break
-                if len(line) > _SEARCH_MAX_LINE:
-                    skipped_long += 1
+                if tag == "os":
                     continue
-                if rx.search(line):
-                    if len(matches) >= _SEARCH_MAX_MATCHES:
-                        truncated = True
+                if "\x00" in text[:1024]:
+                    skipped_binary += 1
+                    continue
+                for lineno, line in enumerate(text.splitlines(), 1):
+                    if (lineno % _SEARCH_YIELD_EVERY == 0
+                            and time.monotonic() > deadline):
+                        out_of_time = True
                         break
-                    matches.append(f"{rel}:{lineno}: {line.strip()[:_MATCH_LINE_CAP]}")
-            await asyncio.sleep(0)
+                    if len(line) > _SEARCH_MAX_LINE:
+                        skipped_long += 1
+                        continue
+                    if rx.search(line):
+                        if len(matches) >= _SEARCH_MAX_MATCHES:
+                            truncated = True
+                            break
+                        matches.append(
+                            f"{rel}:{lineno}: {line.strip()[:_MATCH_LINE_CAP]}")
+                if out_of_time or truncated:
+                    break
             if out_of_time or truncated:
                 break
         if not matches:
@@ -668,16 +702,21 @@ def register_file_tools(
         if not pattern:
             return ToolResult(False, "缺少 pattern", "glob_files 需要 pattern。")
         ws = workspace_for(ctx)
-        hits: list[str] = []
-        truncated = False
-        for rel, p in ws.walk():
-            if not (fnmatch.fnmatch(rel, pattern)
-                    or fnmatch.fnmatch(p.name, pattern)):
-                continue
-            if len(hits) >= _GLOB_MAX_RESULTS:
-                truncated = True
-                break
-            hits.append(f"- {rel} ({p.stat().st_size}B)")
+
+        def _scan():
+            hits: list[str] = []
+            truncated = False
+            for rel, p in ws.walk():
+                if not (fnmatch.fnmatch(rel, pattern)
+                        or fnmatch.fnmatch(p.name, pattern)):
+                    continue
+                if len(hits) >= _GLOB_MAX_RESULTS:
+                    truncated = True
+                    break
+                hits.append(f"- {rel} ({p.stat().st_size}B)")
+            return hits, truncated
+
+        hits, truncated = await asyncio.to_thread(_scan)
         if not hits:
             return ToolResult(True, "无匹配", f"没有匹配 {pattern} 的文件。")
         body = "\n".join(hits)
@@ -688,7 +727,7 @@ def register_file_tools(
     async def list_files(ctx, args):
         subdirs = tuple(args.get("dirs") or ())
         ws = workspace_for(ctx)
-        entries = ws.list(subdirs)
+        entries = await asyncio.to_thread(ws.list, subdirs)
         if not entries:
             return ToolResult(True, "空", "工作区无文件。")
         lines = [f"- [{e['type'][:1]}] {e['path']} ({e['size']}B)" for e in entries]

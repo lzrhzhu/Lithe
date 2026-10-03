@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.9.20 (2026-10-03)
+
+The hardening + observability round: an injected client can no longer
+silently time out, dirty gateway usage can no longer kill a run, every
+event carries attribution and order, runs report how long things took,
+parallel workers share one budget ceiling, and the workspace tools keep
+their disk I/O off the event loop.
+
+- **injected `http_client` timeout upgrade** — a host-supplied
+  `httpx.AsyncClient()` carries httpx's 5-second default reads, far below
+  `LLMConfig.timeout` (180s) and fatal for reasoning-model calls; the
+  runtime now upgrades that exact default to `cfg.timeout` before driving
+  the run. A deliberately narrowed or widened timeout (or a duck-typed
+  client without one) is left untouched.
+- **fault-tolerant usage normalization** — `norm_usage` coerces every
+  integer field through a `_to_int` helper (comma-grouped strings like
+  `"1,234"` parse; unparseable values degrade to 0), matching the
+  runtime's long-standing `_as_int` contract for custom transports: one
+  malformed usage field from a gateway can no longer crash an otherwise
+  successful multi-step run from inside the built-in transports.
+- **event attribution** — every event leaving the runtime is stamped with
+  its run's `run_id` and a monotonic per-run `seq` (reset at each
+  `run()`), so a consumer multiplexing runs over one channel can
+  attribute, order and gap-check without per-host enrichment.
+- **timing metrics** — `RunStats.duration_s` (also on the runtime-emitted
+  `done` envelope); `elapsed_ms` on every `tool_result` (frontends can
+  render "search_files (2.3s)" from the event, not private patching);
+  `ttft_ms` on the first `assistant_delta` of each streamed call, echoed
+  on that call's `usage` event (`None` when not streaming).
+- **parallel-delegation budget visibility** — each delegation registers a
+  live-usage slot in the run's shared state and folds every usage event
+  into it as the child spends; concurrently running siblings count each
+  other's live spend against their own `max_cost` / `max_total_tokens`
+  caps, so N parallel workers share one ceiling instead of each burning
+  the full cap (previously (N+1)× the ceiling could be in flight before
+  any check fired). Slots are keyed per delegation and popped at
+  completion — sequential delegations keep their independent caps, and
+  the run-wide accounting fold is unchanged.
+- **workspace tools off the event loop** — `read_file` / `write_file` /
+  `edit_file` / `list_files` / `glob_files` and the `search_files` tree
+  walk now run their disk I/O through `asyncio.to_thread` (batched reads
+  for the scan), the same policy the images/documents bundles already
+  followed: one slow read on a cold or NFS workspace no longer stalls
+  every concurrent agent run in the process. Diffs and line-delta
+  computation ride along.
+
 ## 0.9.19 (2026-10-03)
 
 The document-perception round: models that read PDFs become reachable

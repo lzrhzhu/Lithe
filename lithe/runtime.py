@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import queue as _queue
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -339,10 +341,13 @@ class RunStats:
     ``prompt_tokens``, not additive); ``context_tokens`` is the *input*
     context length of the last call (what the model actually saw —
     the number to compare against ``context_window`` for a fullness gauge).
+    ``duration_s`` is the wall-clock length of the run, stamped when it
+    ends (the DONE event carries it too).
     """
     final_text: str = ""
     status: str = "done"
     last_step: int = 0
+    duration_s: float = 0.0
     total_cost: float = 0.0
     total_tokens: int = 0
     prompt_tokens: int = 0
@@ -595,17 +600,39 @@ class AgentRuntime:
         # Off by default so AgentHost-based hosts never see duplicates.
         self.emit_envelope = emit_envelope
         self.transport = make_transport(llm_config.transport)
+        # Per-run monotonic event counter, reset at each run() start (see
+        # _emit): consumers multiplexing runs over one channel get stable
+        # ordering and gap detection without re-implementing enrichment.
+        self._seq = itertools.count()
 
-    def _over_budget(self, stats: RunStats) -> bool:
+    def _over_budget(self, ctx: AgentContext, stats: RunStats) -> bool:
         """True when cumulative cost / token accounting has crossed the
         configured budget caps. Checked after each model call (before any
         further tool execution) and before the next call — the latter matters
         when a host seeds ``stats`` with prior-conversation totals to budget
-        across runs."""
+        across runs.
+
+        Parallel-delegation visibility: when the context carries in-flight
+        sibling usage (``ctx.shared["_inflight_sub_usage"]``, maintained by
+        lithe.bundles.subagents), a subagent runtime counts its concurrently
+        running siblings' live spend against its own cap — N parallel
+        workers each capped at ``max_cost`` can no longer burn N × max_cost
+        together before any check fires. Completed (sequential) delegations
+        stay outside this check; their spend folds into the run-wide
+        accounting accumulator at delegation end, as before.
+        """
+        cost = stats.total_cost
+        tokens = stats.total_tokens
+        inflight = ctx.shared.get("_inflight_sub_usage")
+        if inflight:
+            me = ctx.extra.get("_delegation_slot")
+            for slot, usage in inflight.items():
+                if slot != me:
+                    cost += usage.get("cost", 0.0)
+                    tokens += usage.get("tokens", 0)
         return (
-            (self.max_cost is not None and stats.total_cost > self.max_cost)
-            or (self.max_total_tokens is not None
-                and stats.total_tokens > self.max_total_tokens)
+            (self.max_cost is not None and cost > self.max_cost)
+            or (self.max_total_tokens is not None and tokens > self.max_total_tokens)
         )
 
     def _effective_char_budget(self, cfg: LLMConfig, size_state: dict) -> int | None:
@@ -663,7 +690,15 @@ class AgentRuntime:
         return await self._emit(ctx, {"type": EventType.ASSISTANT, "text": text})
 
     async def _emit(self, ctx: AgentContext, event: Event) -> Event:
-        """Publish to sinks and return the event for the caller to yield."""
+        """Publish to sinks and return the event for the caller to yield.
+
+        Every event is stamped with its run's id and a monotonic per-run
+        sequence number before fan-out, so a consumer multiplexing several
+        runs over one channel can attribute and order what it sees (and
+        detect gaps) without re-implementing enrichment per host.
+        """
+        event.setdefault("run_id", ctx.run_id)
+        event["seq"] = next(self._seq)
         await self._publish(ctx, event)
         return event
 
@@ -708,6 +743,8 @@ class AgentRuntime:
         stats = stats if stats is not None else RunStats()
         cfg = self.llm_config
         stats.context_window = cfg.context_window
+        started = time.monotonic()
+        self._seq = itertools.count()
         # Publish the stop handle into the run's shared state so derived
         # runtimes (subagents) can propagate cancellation. Always set (even
         # to None) so a reused context never inherits a previous run's handle.
@@ -730,6 +767,16 @@ class AgentRuntime:
         # every signature's count (see _dispatch_at). Fresh for every `run`.
         repeat_state: dict = {"epoch": 0, "counts": {}}
         if self.http_client is not None:
+            # An injected client keeps whatever timeout its host configured —
+            # except the httpx default (5s reads), which is far below the
+            # kernel's own cfg.timeout and fatal for long reasoning calls.
+            # Upgrade that default to cfg.timeout; a deliberately narrowed or
+            # widened host timeout (or a duck-typed client without one) is
+            # left untouched.
+            if (cfg.timeout is not None
+                    and getattr(self.http_client, "timeout", None)
+                    == httpx.Timeout(5.0)):
+                self.http_client.timeout = cfg.timeout
             async for event in self._drive(ctx, messages, tools_spec,
                                            self.http_client, cfg, stats,
                                            size_state, repeat_state, stop,
@@ -742,12 +789,14 @@ class AgentRuntime:
                                                size_state, repeat_state, stop,
                                                inbox):
                     yield event
+        stats.duration_s = round(time.monotonic() - started, 3)
         if self.emit_envelope:
             yield await self._emit(ctx, {
                 "type": EventType.DONE, "run_id": ctx.run_id,
                 "steps": stats.last_step, "status": stats.status,
                 "cost": round(stats.total_cost, 6),
-                "tokens": stats.total_tokens})
+                "tokens": stats.total_tokens,
+                "duration_s": stats.duration_s})
 
     async def _drive(
         self, ctx: AgentContext, messages: list[dict], tools_spec: list[dict],
@@ -804,7 +853,7 @@ class AgentRuntime:
             state["finished"] = True
             yield await self._emit(ctx, {"type": EventType.CANCELLED, "step": step})
             return
-        if self._over_budget(stats):
+        if self._over_budget(ctx, stats):
             # Budget guard before spending another model call. Unreachable in
             # the normal loop (the post-call guard below cuts first), but real
             # for a host seeding `stats` with prior-conversation totals to
@@ -866,6 +915,8 @@ class AgentRuntime:
         # ended the run "successfully" with an empty final answer.
         for empty_attempt in range(2):
             result = None
+            call_t0 = time.monotonic()
+            ttft_ms: int | None = None  # first streamed delta of this call
             try:
                 stream_fn = getattr(self.transport, "complete_stream", None)
                 if cfg.stream and stream_fn is not None:
@@ -898,9 +949,18 @@ class AgentRuntime:
                                           "step": step})
                                 return
                             if part.get("delta"):
-                                yield await self._emit(
-                                    ctx, {"type": EventType.ASSISTANT_DELTA,
-                                          "text": part["delta"]})
+                                delta_ev: Event = {
+                                    "type": EventType.ASSISTANT_DELTA,
+                                    "text": part["delta"]}
+                                if ttft_ms is None:
+                                    # Time-to-first-token: the key UX metric
+                                    # for streaming, stamped on the delta
+                                    # that proves generation started (and
+                                    # echoed on the call's usage event).
+                                    ttft_ms = round(
+                                        (time.monotonic() - call_t0) * 1000)
+                                    delta_ev["ttft_ms"] = ttft_ms
+                                yield await self._emit(ctx, delta_ev)
                             elif "result" in part:
                                 result = part["result"]
                 else:
@@ -1021,6 +1081,7 @@ class AgentRuntime:
             "context_tokens": prompt, "context_chars": ctx_chars,
             "context_window": window, "context_percent": percent,
             "finish_reason": finish_reason,
+            "ttft_ms": ttft_ms if cfg.stream else None,
         })
 
         if not tool_calls:
@@ -1039,7 +1100,7 @@ class AgentRuntime:
             state["finished"] = True
             return
 
-        if self._over_budget(stats):
+        if self._over_budget(ctx, stats):
             # The call that just accounted crossed the budget: execute no
             # further tool calls (their results would only buy another model
             # call we refuse to make). The run ends with the model's own text
@@ -1116,6 +1177,7 @@ class AgentRuntime:
                 groups.append((batch, [idx]))
 
         results: dict[int, ToolResult] = {}
+        timings: dict[int, int] = {}  # idx → dispatch wall-clock (ms)
 
         async def _dispatch_at(i: int) -> ToolResult:
             tc, args, _err = parsed[i]
@@ -1129,7 +1191,9 @@ class AgentRuntime:
                 # signature, so the epoch bump restarts their counters.
                 repeat_state["epoch"] += 1
                 bumped = True
+            t0 = time.monotonic()
             res = await self.registry.dispatch(name, args, ctx)
+            timings[i] = round((time.monotonic() - t0) * 1000)
             if self.repeat_call_limit is not None:
                 # Stuck-model guard: the identical (tool, args) call issued
                 # yet again — with no mutating tool in between — gets an
@@ -1184,6 +1248,10 @@ class AgentRuntime:
             res = results[idx]
             tr: Event = {"type": EventType.TOOL_RESULT, "step": step, "id": tcid,
                          "name": name, "ok": res.ok, "summary": res.summary}
+            if idx in timings:
+                # wall-clock length of the dispatch ("search_files (2.3s)"),
+                # machine-readable for frontends and metrics sinks
+                tr["elapsed_ms"] = timings[idx]
             if not res.ok:
                 tr["error"] = res.content
             yield await self._emit(ctx, tr)

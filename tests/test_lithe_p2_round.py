@@ -221,6 +221,29 @@ async def test_injected_http_client_forwarded_and_reused():
     assert tr.seen_clients == [sentinel, sentinel], "注入 client 跨 run 复用"
 
 
+async def test_injected_http_client_default_timeout_upgraded():
+    # A plain httpx.AsyncClient() carries 5s reads — fatal for reasoning
+    # models. The runtime upgrades it to cfg.timeout instead of ignoring it.
+    tr = _FakeTransport([_resp("a")])
+    rt = _runtime(tr, http_client=httpx.AsyncClient())
+    assert rt.http_client.timeout == httpx.Timeout(5.0)
+    _ = [e async for e in rt.run(_ctx(),
+                                 [{"role": "user", "content": "q"}], [])]
+    assert rt.http_client.timeout == httpx.Timeout(180.0)  # cfg.timeout default
+    await rt.http_client.aclose()
+
+
+async def test_injected_http_client_custom_timeout_untouched():
+    tr = _FakeTransport([_resp("a")])
+    custom = httpx.Timeout(30.0)
+    rt = _runtime(tr, http_client=httpx.AsyncClient(timeout=custom))
+    _ = [e async for e in rt.run(_ctx(),
+                                 [{"role": "user", "content": "q"}], [])]
+    # a deliberately configured host timeout is respected, not overridden
+    assert rt.http_client.timeout == custom
+    await rt.http_client.aclose()
+
+
 # --------------------------------------------------------------------------- #
 # tools: non-object args on the public dispatch path
 # --------------------------------------------------------------------------- #

@@ -166,6 +166,23 @@ def _merge_extra(extra_body: dict | None, internal: dict) -> dict:
     return merged
 
 
+def _to_int(val) -> int:
+    """Best-effort integer coercion for gateway usage fields.
+
+    Real gateways send ``"1,234"``, float-strings or worse in usage blocks;
+    an unparseable value degrades to 0 rather than crashing an otherwise
+    successful run — the same contract the runtime applies to custom
+    transports (``_as_int``).
+    """
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        try:
+            return int(str(val).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return 0
+
+
 def norm_usage(usage: dict | None) -> dict:
     """Normalize vendor usage shapes into one contract.
 
@@ -177,28 +194,32 @@ def norm_usage(usage: dict | None) -> dict:
     either vendor detail shape (``prompt_tokens_details.cached_tokens`` /
     ``input_tokens_details.cached_tokens``) — they are a subset of
     ``prompt_tokens``, not additive. Any extra vendor fields
-    (``cost_breakdown``, ...) pass through.
+    (``cost_breakdown``, ...) pass through. All integer coercion is
+    fault-tolerant (see :func:`_to_int`): a dirty value becomes 0 instead of
+    a ValueError that would kill the run.
     """
     u = dict(usage or {})
-    p = u.get("prompt_tokens", u.get("input_tokens"))
-    c = u.get("completion_tokens", u.get("output_tokens"))
-    if p is not None:
-        u["prompt_tokens"] = int(p)
-    if c is not None:
-        u["completion_tokens"] = int(c)
-    t = u.get("total_tokens")
-    if t is None and p is not None and c is not None:
-        t = int(p) + int(c)
-    if t is not None:
-        u["total_tokens"] = int(t)
+    p_raw = u.get("prompt_tokens", u.get("input_tokens"))
+    c_raw = u.get("completion_tokens", u.get("output_tokens"))
+    p, c = _to_int(p_raw), _to_int(c_raw)
+    if p_raw is not None:
+        u["prompt_tokens"] = p
+    if c_raw is not None:
+        u["completion_tokens"] = c
+    t_raw = u.get("total_tokens")
+    t = _to_int(t_raw)
+    if t_raw is None and p_raw is not None and c_raw is not None:
+        t = p + c
+    if t_raw is not None or (p_raw is not None and c_raw is not None):
+        u["total_tokens"] = t
     for detail_key in ("prompt_tokens_details", "input_tokens_details"):
         details = u.get(detail_key)
         if isinstance(details, dict) and details.get("cached_tokens") is not None:
-            u["cached_tokens"] = int(details["cached_tokens"])
+            u["cached_tokens"] = _to_int(details["cached_tokens"])
             break
     out_details = u.get("output_tokens_details")
     if isinstance(out_details, dict) and out_details.get("reasoning_tokens") is not None:
-        u["reasoning_tokens"] = int(out_details["reasoning_tokens"])
+        u["reasoning_tokens"] = _to_int(out_details["reasoning_tokens"])
     return u
 
 

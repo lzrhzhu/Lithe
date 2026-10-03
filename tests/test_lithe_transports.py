@@ -391,6 +391,23 @@ def test_norm_usage_lifts_cached_tokens():
                                               "output_tokens": 1})
 
 
+def test_norm_usage_tolerates_dirty_gateway_values():
+    from lithe.transports import norm_usage
+    # comma-grouped strings, whitespace, floats-as-str and outright garbage
+    # degrade to coerced/0 values instead of raising out of the transport
+    u = norm_usage({"prompt_tokens": "1,234", "completion_tokens": " 56 ",
+                    "total_tokens": "1,290"})
+    assert u["prompt_tokens"] == 1234 and u["completion_tokens"] == 56
+    assert u["total_tokens"] == 1290
+    u = norm_usage({"input_tokens": "junk", "output_tokens": [3]})
+    assert u["prompt_tokens"] == 0 and u["completion_tokens"] == 0
+    assert u["total_tokens"] == 0
+    u = norm_usage({"prompt_tokens": 5, "completion_tokens": 2,
+                    "prompt_tokens_details": {"cached_tokens": "1,0"},
+                    "output_tokens_details": {"reasoning_tokens": "x"}})
+    assert u["cached_tokens"] == 10 and u["reasoning_tokens"] == 0
+
+
 def test_parse_output_usage_normalized():
     res = _parse_output({"output": [], "usage": {"input_tokens": 4,
                                                  "output_tokens": 1}})
