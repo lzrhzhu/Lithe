@@ -251,6 +251,7 @@ async def test_todo_tools_filtered_by_mode():
 def test_update_todos_description_discourages_trivial_plans():
     reg, _ = _registry_with(TodoStore())
     update_spec = reg.spec("update_todos").to_openai()["function"]
-    assert "single-step actions" in update_spec["description"]
-    assert "fixed count" in update_spec["description"]
-    assert "questions" in update_spec["parameters"]["properties"]["todos"]["description"]
+    assert "单步操作" in update_spec["description"]
+    assert "固定数量" in update_spec["description"]
+    assert "完整" in update_spec["parameters"]["properties"]["todos"]["description"]
+    assert "显示当前任务清单" in reg.spec("list_todos").to_openai()["function"]["description"]

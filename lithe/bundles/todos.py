@@ -210,24 +210,22 @@ def _update_todos_params() -> dict:
             "todos": {
                 "type": "array",
                 "description": (
-                    "Optional planning tool. Do not use for questions, explanations, "
-                    "single-step actions, or small edits. Use only when the user asks "
-                    "for a plan or the work has multiple distinct stages worth tracking. "
-                    "When used, send the COMPLETE task list; this replaces the existing "
-                    "list, it is not a delta. Send every retained task. Length follows "
-                    "the actual distinct steps, never a fixed count."),
+                    "可选的计划工具。普通问答、解释、单步操作和小改动不要使用；"
+                    "仅当用户明确要求计划，或工作确有多个值得跟踪进度的独立阶段时使用。"
+                    "使用时发送完整任务清单：这是整体替换而非增量，保留的任务都要包含；"
+                    "条数按实际独立步骤确定，不凑固定数量。"),
                 "items": {
                     "type": "object",
                     "properties": {
                         "content": {"type": "string",
-                                    "description": "One short sentence describing the task."},
+                                    "description": "用一句话简述这项任务。"},
                         "status": {"type": "string", "enum": list(STATUSES),
                                    "description": (
-                                       "pending = not started; in_progress = working on it "
-                                       "now (keep at most one); completed = done; "
-                                       "cancelled = dropped.")},
+                                       "pending = 未开始；in_progress = 正在进行"
+                                       "（最多一项）；completed = 已完成；"
+                                       "cancelled = 已放弃。")},
                         "priority": {"type": "string", "enum": list(PRIORITIES),
-                                     "description": "Optional, default medium."},
+                                     "description": "可选，默认 medium。"},
                     },
                     "required": ["content", "status"],
                 },
@@ -275,17 +273,15 @@ def register_todo_tools(
 
     registry.register(
         ToolSpec("update_todos",
-                  "Optional planning tool. Do not call it for ordinary questions, "
-                  "explanations, single-step actions, or small edits. Use it only when "
-                  "the user asks for a plan or the work has multiple distinct stages "
-                  "that need progress tracking. Before replacing an existing list, "
-                  "read it with list_todos and preserve unrelated active items. Send "
-                  "the COMPLETE list. Create one task per actual distinct step, keep "
-                  "at most one in_progress, and never target a fixed count such as 3.",
+                  "可选的计划工具。普通问答、解释、单步操作和小改动不要调用；"
+                  "仅当用户明确要求计划，或工作确有多个需要跟踪进度的独立阶段时使用。"
+                  "替换已有清单前先用 list_todos 读取，并保留与本次无关的未完成事项；"
+                  "每次发送完整清单（整体替换，不是增量）。每个独立步骤对应一条任务，"
+                  "同时最多保持一项 in_progress，条数按实际步骤确定，不以 3 这类固定数量为目标。",
                   _update_todos_params(), ToolCategory.WRITE),
         update_todos, reverter=_revert, revert_kind="todo_replace")
     registry.register(
-        ToolSpec("list_todos", "Show the current task list with statuses.",
+        ToolSpec("list_todos", "显示当前任务清单及各项状态。",
                  {"type": "object", "properties": {}}, ToolCategory.READ),
         list_todos)
 
