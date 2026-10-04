@@ -260,6 +260,25 @@ def _revisions(ctx: AgentContext) -> dict:
     return ctx.shared.setdefault("_file_revisions", {})
 
 
+def _generations(ctx: AgentContext) -> dict:
+    """Per-path write generation (shared run-wide): bumped by every in-run
+    write through the bundled tools. A context whose last read/write of a
+    path happened at an older generation is working from stale content —
+    typically a parallel subagent whose sibling (or the orchestrator) wrote
+    the file after it read."""
+    return ctx.shared.setdefault("_ws_generations", {})
+
+
+def _seen_gens(ctx: AgentContext) -> dict:
+    """Per-context \"I last observed path P at generation G\" stamps.
+
+    Lives in ``ctx.extra`` (copied per context — the orchestrator and every
+    subagent keep their OWN observation history; a subagent inherits the
+    orchestrator's stamps at delegation start, correctly so: it has not
+    seen anything newer)."""
+    return ctx.extra.setdefault("_ws_seen_gens", {})
+
+
 # --- per-run file-creation guard (runaway-loop brake) ------------------------
 #
 # The OLD guard refused new files when the whole tree held more than
@@ -315,27 +334,81 @@ def _stat(ws: Workspace, rel: str):
         return None
 
 
-def _record_revision(ctx: AgentContext, ws: Workspace, rel: str) -> None:
+def _apply_revision(ctx: AgentContext, ws: Workspace, rel: str, snap,
+                    *, written: bool = False) -> None:
+    """Record one observation of *rel*: refresh the run-wide snapshot, and
+    stamp the observing context's generation (writes bump the run's
+    generation first, so the writer itself stays fresh for chained
+    write→edit flows while every OTHER context's older stamp goes stale)."""
     key = str(ws.safe_path(rel))
-    snap = _stat(ws, rel)
     if snap is None:
         _revisions(ctx).pop(key, None)
     else:
         _revisions(ctx)[key] = snap
+    gens = _generations(ctx)
+    if written:
+        gens[key] = gens.get(key, 0) + 1
+    _seen_gens(ctx)[key] = gens.get(key, 0)
+
+
+def _record_revision(ctx: AgentContext, ws: Workspace, rel: str) -> None:
+    _apply_revision(ctx, ws, rel, _stat(ws, rel), written=True)
+
+
+def _ws_write_lock(ctx: AgentContext) -> asyncio.Lock:
+    """The run's exclusive file-mutation lock.
+
+    Lives in ``ctx.shared`` so every subagent context of the run holds the
+    SAME lock by reference: within one runtime WRITE tools already run alone,
+    but parallel subagents each drive their own runtime — without this lock
+    their write tools interleave at every ``await asyncio.to_thread(...)``
+    hop, and the freshness check-then-act loses to a concurrent write (both
+    writers pass before either lands). The lock serializes the section so
+    the generation check in :func:`_check_fresh` — not lock ordering alone —
+    deterministically refuses the second writer.
+
+    Readers do NOT take the lock (READ tools stay parallel); their safety
+    comes from read_file's stat-BEFORE-read snapshot ordering: a write that
+    slips between stat and read leaves the recorded snapshot OLDER than the
+    content the model saw, so the model's next write is (conservatively)
+    refused and it re-reads. Undo reverters write directly and bypass the
+    lock; undo runs standalone, never concurrent with agent runs.
+    """
+    lock = ctx.shared.get("_ws_write_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        ctx.shared["_ws_write_lock"] = lock
+    return lock
 
 
 def _check_fresh(ctx: AgentContext, ws: Workspace, rel: str) -> ToolResult | None:
-    """``None`` when fresh (or never read this run); a refusal otherwise."""
+    """``None`` when fresh (or never read this run); a refusal otherwise.
+
+    Two detection layers, both required:
+
+    - the run-wide snapshot comparison catches EXTERNAL changes (out-of-band
+      edits after any context of this run read the path);
+    - the per-context generation comparison catches IN-RUN writers: the
+      first bundled write refreshes the shared snapshot to its own stat, so
+      a stat comparison alone would wave a sibling's stale write through —
+      the generation stamp ("what I personally last observed") does not
+      refresh with it, so a parallel subagent (or the orchestrator) that
+      has not re-read since the other's write is refused.
+    """
     key = str(ws.safe_path(rel))
     recorded = _revisions(ctx).get(key)
     if recorded is None:
         return None
     current = _stat(ws, rel)
-    if current is not None and current != recorded:
+    seen = _seen_gens(ctx).get(key)
+    stale = (current is not None and current != recorded) or (
+        seen is not None and seen != _generations(ctx).get(key, 0))
+    if stale:
         return ToolResult(
             False, "文件已变更",
-            f"文件 {rel} 在上次读取之后被修改（可能是外部改动或其它工具写入）。"
-            f"请先重新 read_file 获取最新内容，再执行写入或编辑。")
+            f"文件 {rel} 在上次读取之后被修改（可能是外部改动，或本运行的"
+            f"其它工具/并行子代理写入）。请先重新 read_file 获取最新内容，"
+            f"再执行写入或编辑。")
     return None
 
 
@@ -578,12 +651,23 @@ def register_file_tools(
             # policy as the images/documents bundles): one slow read on a
             # cold/NFS workspace must not stall every concurrent agent run
             # in the process.
-            content = await asyncio.to_thread(ws.read, rel)
+            def _read_snapshot():
+                # Stat BEFORE reading, inside one worker-thread unit: a
+                # concurrent write that lands between the two leaves the
+                # recorded snapshot OLDER than the content we return, so
+                # the model's next write is (conservatively) refused with
+                # "re-read" — the reverse order would stamp a post-write
+                # stat onto pre-write content and let a blind overwrite
+                # through the stale guard.
+                snap = _stat(ws, rel)
+                return snap, ws.read(rel)
+
+            snap, content = await asyncio.to_thread(_read_snapshot)
         except FileNotFoundError:
             return ToolResult(False, "文件不存在", f"文件不存在：{rel}")
         except PermissionError as exc:
             return ToolResult(False, "非法路径", str(exc))
-        await asyncio.to_thread(_record_revision, ctx, ws, rel)
+        _apply_revision(ctx, ws, rel, snap)
         offset = args.get("offset")
         limit = args.get("limit")
         if offset is not None or limit is not None:
@@ -618,24 +702,30 @@ def register_file_tools(
         if not rel:
             return ToolResult(False, "缺少 path", "缺少 path 参数。")
         ws = workspace_for(ctx)
-        stale = await asyncio.to_thread(_check_fresh, ctx, ws, rel)
-        if stale is not None:
-            return stale
-        guard = await asyncio.to_thread(_check_run_growth, ctx, ws, [rel])
-        if guard is not None:
-            return guard
 
         def _read_old():
             return ws.read(rel) if ws.exists(rel) else None
 
-        old = await asyncio.to_thread(_read_old)
-        try:
-            await asyncio.to_thread(ws.write, rel, content)
-        except (PermissionError, ValueError, RuntimeError) as exc:
-            return ToolResult(False, "写入失败", str(exc))
-        await asyncio.to_thread(_record_revision, ctx, ws, rel)
-        if old is None:
-            await asyncio.to_thread(_note_created, ctx, ws, rel)
+        # Freshness is check-then-act and every await below is a suspension
+        # point where a parallel subagent's write could land unseen; the
+        # run-wide lock (shared with every subagent context) closes that
+        # window: the second writer's check sees the first's refreshed
+        # snapshot and refuses instead of silently clobbering.
+        async with _ws_write_lock(ctx):
+            stale = await asyncio.to_thread(_check_fresh, ctx, ws, rel)
+            if stale is not None:
+                return stale
+            guard = await asyncio.to_thread(_check_run_growth, ctx, ws, [rel])
+            if guard is not None:
+                return guard
+            old = await asyncio.to_thread(_read_old)
+            try:
+                await asyncio.to_thread(ws.write, rel, content)
+            except (PermissionError, ValueError, RuntimeError) as exc:
+                return ToolResult(False, "写入失败", str(exc))
+            await asyncio.to_thread(_record_revision, ctx, ws, rel)
+            if old is None:
+                await asyncio.to_thread(_note_created, ctx, ws, rel)
         added, removed = await asyncio.to_thread(_line_delta, old, content)
         ui = await asyncio.to_thread(_file_change, "write", rel, old, content)
         return ToolResult(True, f"写入 {rel}{_delta_note(added, removed, created=old is None)}",
@@ -654,80 +744,85 @@ def register_file_tools(
         if old_text == new_text:
             return ToolResult(False, "无变化", "old_text 与 new_text 相同，无需编辑。")
         ws = workspace_for(ctx)
-        try:
-            content = await asyncio.to_thread(ws.read, rel)
-        except FileNotFoundError:
-            return ToolResult(False, "文件不存在", f"文件不存在：{rel}")
-        except PermissionError as exc:
-            return ToolResult(False, "非法路径", str(exc))
-        stale = await asyncio.to_thread(_check_fresh, ctx, ws, rel)
-        if stale is not None:
-            return stale
-        count = content.count(old_text)
-        fuzzy_note = ""
-        if count == 0:
-            # Exact substring failed — fall back to a whole-line ladder match
-            # (shared with apply_patch): tolerates stray trailing whitespace,
-            # missing indentation and typographic Unicode punctuation, and
-            # strips "N: " prefixes copied from read_file's numbered output.
-            # The replaced span becomes whole lines, apply_patch-style.
-            lines = content.split("\n")
-            pattern = old_text.split("\n")
-            # Mirror apply_patch's trailing-blank alignment: when the model's
-            # old_text carries a phantom trailing newline, drop it AND the
-            # replacement's counterpart — otherwise every fuzzy hit inserts
-            # one extra blank line per edit.
-            replacement = new_text.split("\n")
-            if pattern and pattern[-1] == "":
-                pattern = pattern[:-1]
-                if replacement and replacement[-1] == "":
-                    replacement = replacement[:-1]
-            hits = line_span_hits(lines, pattern) if pattern else []
-            if not hits:
-                stripped = [_LINE_NO_PREFIX.sub("", p, count=1) for p in pattern]
-                if any(s != p for s, p in zip(stripped, pattern, strict=True)):
-                    hits = line_span_hits(lines, stripped)
-                    pattern = stripped
-            if not hits:
-                return ToolResult(False, "未匹配", f"在 {rel} 中未找到 old_text。")
-            if len(hits) > 1 and not replace_all:
-                shown = ",".join(str(h + 1) for h in hits[:5])
-                more = "…" if len(hits) > 5 else ""
+        # Same run-wide mutation lock as write_file: read-current, freshness
+        # check, and the write it authorizes must be one unit against
+        # parallel subagent writers, or the derived new_content can land on
+        # top of a concurrent write the freshness check never saw.
+        async with _ws_write_lock(ctx):
+            try:
+                content = await asyncio.to_thread(ws.read, rel)
+            except FileNotFoundError:
+                return ToolResult(False, "文件不存在", f"文件不存在：{rel}")
+            except PermissionError as exc:
+                return ToolResult(False, "非法路径", str(exc))
+            stale = await asyncio.to_thread(_check_fresh, ctx, ws, rel)
+            if stale is not None:
+                return stale
+            count = content.count(old_text)
+            fuzzy_note = ""
+            if count == 0:
+                # Exact substring failed — fall back to a whole-line ladder match
+                # (shared with apply_patch): tolerates stray trailing whitespace,
+                # missing indentation and typographic Unicode punctuation, and
+                # strips "N: " prefixes copied from read_file's numbered output.
+                # The replaced span becomes whole lines, apply_patch-style.
+                lines = content.split("\n")
+                pattern = old_text.split("\n")
+                # Mirror apply_patch's trailing-blank alignment: when the model's
+                # old_text carries a phantom trailing newline, drop it AND the
+                # replacement's counterpart — otherwise every fuzzy hit inserts
+                # one extra blank line per edit.
+                replacement = new_text.split("\n")
+                if pattern and pattern[-1] == "":
+                    pattern = pattern[:-1]
+                    if replacement and replacement[-1] == "":
+                        replacement = replacement[:-1]
+                hits = line_span_hits(lines, pattern) if pattern else []
+                if not hits:
+                    stripped = [_LINE_NO_PREFIX.sub("", p, count=1) for p in pattern]
+                    if any(s != p for s, p in zip(stripped, pattern, strict=True)):
+                        hits = line_span_hits(lines, stripped)
+                        pattern = stripped
+                if not hits:
+                    return ToolResult(False, "未匹配", f"在 {rel} 中未找到 old_text。")
+                if len(hits) > 1 and not replace_all:
+                    shown = ",".join(str(h + 1) for h in hits[:5])
+                    more = "…" if len(hits) > 5 else ""
+                    return ToolResult(
+                        False, "匹配多处",
+                        f"old_text（模糊整行匹配）在 {rel} 中出现 {len(hits)} 次"
+                        f"（第 {shown}{more} 行）。请提供更长且唯一的 old_text，"
+                        f"或设置 replace_all=true 全部替换。")
+                new_lines = lines[:]
+                for start in reversed(hits):
+                    new_lines[start:start + len(pattern)] = replacement
+                new_content = "\n".join(new_lines)
+                replaced = len(hits)
+                fuzzy_note = "（模糊整行匹配：忽略空白/标点差异后定位）"
+            elif count > 1 and not replace_all:
+                # Old behavior (silent replace-all) let one vague old_text clobber
+                # every occurrence. Refuse and show where the matches are so the
+                # model can either widen old_text or pass replace_all explicitly.
+                lines: list[int] = []
+                pos = content.find(old_text)
+                while pos != -1 and len(lines) < 5:
+                    lines.append(content[:pos].count("\n") + 1)
+                    pos = content.find(old_text, pos + 1)
+                more = "…" if count > len(lines) else ""
                 return ToolResult(
                     False, "匹配多处",
-                    f"old_text（模糊整行匹配）在 {rel} 中出现 {len(hits)} 次"
-                    f"（第 {shown}{more} 行）。请提供更长且唯一的 old_text，"
-                    f"或设置 replace_all=true 全部替换。")
-            new_lines = lines[:]
-            for start in reversed(hits):
-                new_lines[start:start + len(pattern)] = replacement
-            new_content = "\n".join(new_lines)
-            replaced = len(hits)
-            fuzzy_note = "（模糊整行匹配：忽略空白/标点差异后定位）"
-        elif count > 1 and not replace_all:
-            # Old behavior (silent replace-all) let one vague old_text clobber
-            # every occurrence. Refuse and show where the matches are so the
-            # model can either widen old_text or pass replace_all explicitly.
-            lines: list[int] = []
-            pos = content.find(old_text)
-            while pos != -1 and len(lines) < 5:
-                lines.append(content[:pos].count("\n") + 1)
-                pos = content.find(old_text, pos + 1)
-            more = "…" if count > len(lines) else ""
-            return ToolResult(
-                False, "匹配多处",
-                f"old_text 在 {rel} 中出现 {count} 次（第 "
-                f"{','.join(map(str, lines))}{more} 行）。请提供更长且唯一的 "
-                f"old_text，或设置 replace_all=true 全部替换。")
-        else:
-            new_content = (content.replace(old_text, new_text) if replace_all
-                           else content.replace(old_text, new_text, 1))
-            replaced = count if replace_all else 1
-        try:
-            await asyncio.to_thread(ws.write, rel, new_content)
-        except (PermissionError, ValueError, RuntimeError) as exc:
-            return ToolResult(False, "写入失败", str(exc))
-        await asyncio.to_thread(_record_revision, ctx, ws, rel)
+                    f"old_text 在 {rel} 中出现 {count} 次（第 "
+                    f"{','.join(map(str, lines))}{more} 行）。请提供更长且唯一的 "
+                    f"old_text，或设置 replace_all=true。")
+            else:
+                new_content = (content.replace(old_text, new_text) if replace_all
+                               else content.replace(old_text, new_text, 1))
+                replaced = count if replace_all else 1
+            try:
+                await asyncio.to_thread(ws.write, rel, new_content)
+            except (PermissionError, ValueError, RuntimeError) as exc:
+                return ToolResult(False, "写入失败", str(exc))
+            await asyncio.to_thread(_record_revision, ctx, ws, rel)
         diff = await asyncio.to_thread(_compact_diff, rel, content, new_content)
         body = f"已替换 {rel} 中的指定文本（{replaced} 处）{fuzzy_note}。"
         if diff:

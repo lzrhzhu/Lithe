@@ -370,7 +370,7 @@ def register_apply_patch_tool(
     async def apply_patch(ctx: AgentContext, args: dict) -> ToolResult:
         from lithe.bundles.workspace import (
             _check_fresh, _check_run_growth, _compact_diff, _delta_note,
-            _file_change, _note_created, _record_revision,
+            _file_change, _note_created, _record_revision, _ws_write_lock,
         )
 
         patch_text = args.get("patch_text") or ""
@@ -398,85 +398,93 @@ def register_apply_patch_tool(
                 return overlay[rel]
             return ws.read(rel) if ws.exists(rel) else None
 
-        try:
-            for hunk in hunks:
-                ws.safe_path(hunk.path)  # traversal check up front
-                stale = _check_fresh(ctx, ws, hunk.path)
-                if stale is not None:
-                    return stale
-                if isinstance(hunk, UpdateFile) and hunk.move_path:
-                    stale = _check_fresh(ctx, ws, hunk.move_path)
+        # The freshness checks in phase 1 and the commit in phase 2 must be
+        # one unit against parallel subagent writers: without the run-wide
+        # mutation lock (shared with every subagent context), a concurrent
+        # write_file can land between the checks and the commit and be
+        # silently overwritten. All-or-nothing derivation is unaffected —
+        # it is in-memory — but its inputs (current()/freshness) are read
+        # under the lock so the commit lands on exactly what was checked.
+        async with _ws_write_lock(ctx):
+            try:
+                for hunk in hunks:
+                    ws.safe_path(hunk.path)  # traversal check up front
+                    stale = _check_fresh(ctx, ws, hunk.path)
                     if stale is not None:
                         return stale
-                if isinstance(hunk, AddFile):
-                    old = current(hunk.path)
-                    overlay[hunk.path] = hunk.contents
-                    ui.append(_file_change("write", hunk.path, old, hunk.contents))
-                    applied.append(f"A {hunk.path}")
-                elif isinstance(hunk, DeleteFile):
-                    old = current(hunk.path)
-                    if old is None:
-                        raise PatchApplyError(f"文件不存在：{hunk.path}")
-                    overlay[hunk.path] = None
-                    ui.append(_file_change("delete", hunk.path, old, None))
-                    applied.append(f"D {hunk.path}")
-                else:
-                    if hunk.move_path:
-                        ws.safe_path(hunk.move_path)
-                    old = current(hunk.path)
-                    if old is None:
-                        raise PatchApplyError(f"文件不存在：{hunk.path}")
-                    new_text = derive_new_contents(hunk.path, hunk.chunks, old).new_text
-                    if hunk.move_path:
-                        dest_old = current(hunk.move_path)
-                        overlay[hunk.move_path] = new_text
+                    if isinstance(hunk, UpdateFile) and hunk.move_path:
+                        stale = _check_fresh(ctx, ws, hunk.move_path)
+                        if stale is not None:
+                            return stale
+                    if isinstance(hunk, AddFile):
+                        old = current(hunk.path)
+                        overlay[hunk.path] = hunk.contents
+                        ui.append(_file_change("write", hunk.path, old, hunk.contents))
+                        applied.append(f"A {hunk.path}")
+                    elif isinstance(hunk, DeleteFile):
+                        old = current(hunk.path)
+                        if old is None:
+                            raise PatchApplyError(f"文件不存在：{hunk.path}")
                         overlay[hunk.path] = None
-                        ui.append(
-                            _file_change("write", hunk.move_path, dest_old, new_text)
-                        )
                         ui.append(_file_change("delete", hunk.path, old, None))
-                        applied.append(f"M {hunk.path} -> {hunk.move_path}")
+                        applied.append(f"D {hunk.path}")
                     else:
-                        overlay[hunk.path] = new_text
-                        ui.append(_file_change("edit", hunk.path, old, new_text))
-                        applied.append(f"M {hunk.path}")
-                    diff = _compact_diff(hunk.path, old, new_text)
-                    if diff:
-                        diff_parts.append(diff)
-        except PatchApplyError as exc:
-            return ToolResult(False, "未应用", f"patch 未做任何修改。{exc}")
-        except PermissionError as exc:
-            return ToolResult(False, "非法路径", f"patch 未做任何修改。{exc}")
-        except (OSError, RuntimeError, ValueError) as exc:
-            return ToolResult(False, "预检失败", f"patch 未做任何修改：{exc}")
+                        if hunk.move_path:
+                            ws.safe_path(hunk.move_path)
+                        old = current(hunk.path)
+                        if old is None:
+                            raise PatchApplyError(f"文件不存在：{hunk.path}")
+                        new_text = derive_new_contents(hunk.path, hunk.chunks, old).new_text
+                        if hunk.move_path:
+                            dest_old = current(hunk.move_path)
+                            overlay[hunk.move_path] = new_text
+                            overlay[hunk.path] = None
+                            ui.append(
+                                _file_change("write", hunk.move_path, dest_old, new_text)
+                            )
+                            ui.append(_file_change("delete", hunk.path, old, None))
+                            applied.append(f"M {hunk.path} -> {hunk.move_path}")
+                        else:
+                            overlay[hunk.path] = new_text
+                            ui.append(_file_change("edit", hunk.path, old, new_text))
+                            applied.append(f"M {hunk.path}")
+                        diff = _compact_diff(hunk.path, old, new_text)
+                        if diff:
+                            diff_parts.append(diff)
+            except PatchApplyError as exc:
+                return ToolResult(False, "未应用", f"patch 未做任何修改。{exc}")
+            except PermissionError as exc:
+                return ToolResult(False, "非法路径", f"patch 未做任何修改。{exc}")
+            except (OSError, RuntimeError, ValueError) as exc:
+                return ToolResult(False, "预检失败", f"patch 未做任何修改：{exc}")
 
-        # Phase 2 — commit: one write/delete per touched path. A mid-commit
-        # failure reports what landed (the events carry full undo data).
-        new_rels = [rel for rel, value in overlay.items()
-                    if value is not None and not ws.exists(rel)]
-        guard = _check_run_growth(ctx, ws, new_rels)
-        if guard is not None:
-            return guard
-        landed: list[str] = []
-        try:
-            for rel, value in overlay.items():
-                if value is None:
-                    if ws.exists(rel):
-                        ws.delete(rel)
-                else:
-                    ws.write(rel, value)
-                _record_revision(ctx, ws, rel)  # refresh (or drop) the snapshot
-                landed.append(rel)
-        except (PermissionError, ValueError, RuntimeError, OSError) as exc:
-            done = "、".join(landed) if landed else "无"
-            return ToolResult(
-                False,
-                "部分应用后失败",
-                f"patch 写入失败：{exc}。已落盘：{done}。",
-                ui=ui,
-            )
-        for rel in new_rels:
-            _note_created(ctx, ws, rel)
+            # Phase 2 — commit: one write/delete per touched path. A mid-commit
+            # failure reports what landed (the events carry full undo data).
+            new_rels = [rel for rel, value in overlay.items()
+                        if value is not None and not ws.exists(rel)]
+            guard = _check_run_growth(ctx, ws, new_rels)
+            if guard is not None:
+                return guard
+            landed: list[str] = []
+            try:
+                for rel, value in overlay.items():
+                    if value is None:
+                        if ws.exists(rel):
+                            ws.delete(rel)
+                    else:
+                        ws.write(rel, value)
+                    _record_revision(ctx, ws, rel)  # refresh (or drop) the snapshot
+                    landed.append(rel)
+            except (PermissionError, ValueError, RuntimeError, OSError) as exc:
+                done = "、".join(landed) if landed else "无"
+                return ToolResult(
+                    False,
+                    "部分应用后失败",
+                    f"patch 写入失败：{exc}。已落盘：{done}。",
+                    ui=ui,
+                )
+            for rel in new_rels:
+                _note_created(ctx, ws, rel)
 
         body = "已应用 patch：\n" + "\n".join(applied)
         if diff_parts:

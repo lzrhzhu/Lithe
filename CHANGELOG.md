@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.9.26 (2026-10-04)
+
+The parallel-safety round: parallel subagents can no longer silently
+clobber each other's writes, `delegate_parallel` gains per-task timeouts,
+and delegation can no longer widen a restricted mode's powers.
+
+- **run-wide file-mutation lock + write generations** (`lithe.bundles.workspace`)
+  — the stale-content guard was check-then-act with an `await` between the
+  check and the write, so two parallel subagents writing the same file
+  both passed the check and the second silently clobbered the first
+  (reproduced 60/60 under plain concurrent dispatch). Fixes, both
+  required: (1) `write_file` / `edit_file` / `apply_patch` now hold a
+  per-run `asyncio.Lock` (stored in `ctx.shared`, shared by reference
+  with every subagent context) across check → write → revision-record;
+  (2) the guard gained a per-path write *generation* (bumped by every
+  in-run write) plus per-context "observed-at" stamps in `ctx.extra` —
+  the first writer refreshes the shared snapshot to its own stat, which a
+  stat comparison alone cannot distinguish from fresh, but the sibling's
+  older generation stamp can: the second writer is refused with the
+  existing re-read guidance. Reads stay lock-free (READ tools remain
+  parallel); `read_file` now records its snapshot stat-BEFORE-read inside
+  one worker-thread unit, so a write landing between the two leaves the
+  snapshot older than the content seen — the next write is
+  conservatively refused instead of a blind overwrite passing a
+  fresh-looking snapshot.
+- **`delegate_parallel` per-task timeout** (`lithe.bundles.subagents`) —
+  `make_parallel_delegate_tool(engine, timeout=...)` caps each delegated
+  task's wall-clock individually (counted while running, not while queued
+  behind the `max_parallel` semaphore): a hung worker is cancelled — the
+  delegation's inner runtime generator closes deterministically via the
+  existing `aclosing` — and reported as that agent's failure block while
+  its siblings keep running. `register_delegate_tools(..., timeout=)`
+  now applies to both tools; previously the parallel batch had no
+  timeout at all, so one stuck subagent hung the whole gather past any
+  cancellation checkpoint.
+- **mode fence on delegation** (`lithe.bundles.subagents`, `host`) —
+  `AgentHost.run` stashes its `mode` in `ctx.shared["_host_mode"]`, and
+  `SubagentEngine.trimmed_tools` filters each worker's toolset to that
+  mode's admitted categories: an anchored (read-only) conversation can
+  still delegate research to read-only workers, but can no longer hand a
+  write-capable coder subagent the pen. Direct `engine.run` callers
+  without a stashed mode keep the declared roster unchanged.
+
+## 0.9.25 (2026-10-04)
+
+The prompt-consistency round: the todos bundle's model-facing text is now
+Chinese, like every other bundled tool.
+
+- **`update_todos` / `list_todos` descriptions localized** — the tool
+  descriptions and the `todos` schema texts (array guidance, item
+  content/status/priority) were the only English on an otherwise
+  all-Chinese tool surface; mixed languages dilute instruction weight
+  for models that anchor on the system prompt's language. The guidance
+  is preserved one-to-one (optional planning tool; read before replace;
+  send the COMPLETE list, not a delta; at most one in_progress; never a
+  fixed count) — only the language changed.
+
 ## 0.9.24 (2026-10-04)
 
 The dangerous-command guard: `run_command` gains a pre-execution policy

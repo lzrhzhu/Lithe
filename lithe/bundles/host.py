@@ -339,6 +339,12 @@ class AgentHost:
         inbox=None,
     ) -> AsyncIterator[dict]:
         run_id, user_id = ctx.run_id, ctx.user_id
+        # Stash the run's mode for derived contexts (subagent delegation
+        # reads it to cap each worker's toolset to this mode's admitted
+        # categories — a restricted mode must not gain powers by
+        # delegating). Always set, like the stop handle below, so a reused
+        # context never inherits a previous run's mode.
+        ctx.shared["_host_mode"] = mode
         if create_run:
             self.store.create_run(
                 run_id,

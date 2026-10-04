@@ -30,6 +30,7 @@ from lithe import (
     LLMTransport, AgentContext, AgentRuntime, LLMConfig, RunStats,
     ToolCategory, ToolResult, ToolSpec,
 )
+from lithe.modes import categories_for
 from lithe.bundles.host import AgentHost, StoreSink
 from lithe.bundles.store.protocol import StoredMessage, action_to_row
 
@@ -165,10 +166,17 @@ class SubagentEngine:
         return "\n\n".join(p for p in parts if p)
 
     def trimmed_tools(self, spec: SubagentSpec,
-                      disabled: frozenset[str] | set[str] | None) -> list[dict]:
+                      disabled: frozenset[str] | set[str] | None,
+                      allowed_categories=None) -> list[dict]:
         """OpenAI spec list for the subagent's declared tools (minus disabled).
 
         ``delegate`` is never included, so delegation stays one level deep.
+        ``allowed_categories`` (a category set from :func:`lithe.modes.categories_for`)
+        additionally drops tools the *orchestrator's mode* does not admit —
+        delegation must never widen a restricted mode's powers (an anchored /
+        read-only conversation delegating to a write-capable subagent would).
+        ``None`` keeps the declared list: no mode context (direct engine.run
+        callers, tests).
         """
         dis = set(disabled or ())
         out: list[dict] = []
@@ -176,8 +184,12 @@ class SubagentEngine:
             if name == "delegate" or name in dis:
                 continue
             ts = self.host.registry.spec(name)
-            if ts is not None:
-                out.append(ts.to_openai())
+            if ts is None:
+                continue
+            if (allowed_categories is not None
+                    and ts.category not in allowed_categories):
+                continue
+            out.append(ts.to_openai())
         return out
 
     def _llm_for(self, spec: SubagentSpec) -> LLMConfig:
@@ -236,6 +248,19 @@ class SubagentEngine:
 
         stats = RunStats()
         steps = spec.max_steps or self.max_steps or self.host.max_steps
+        # Mode fence: the orchestrator's run mode (stashed in the run's
+        # shared state by AgentHost.run) caps this subagent's toolset to
+        # that mode's admitted categories — an anchored (read-only)
+        # conversation must not gain write powers by delegating to a
+        # write-capable subagent. No stashed mode (direct engine.run
+        # callers) keeps the declared roster list unchanged.
+        mode = parent_ctx.shared.get("_host_mode")
+        allowed = None
+        if mode is not None:
+            try:
+                allowed = categories_for(mode)
+            except ValueError:
+                allowed = None  # unknown mode name: never widen, never crash
         # Budgets apply per subagent run: each delegation gets its own cap,
         # so one runaway worker cannot burn the whole ceiling unnoticed
         # (the orchestrator's own budget is separate).
@@ -272,7 +297,8 @@ class SubagentEngine:
         try:
             async with contextlib.aclosing(runtime.run(
                     sub_ctx, messages,
-                    self.trimmed_tools(spec, sub_ctx.disabled_tools),
+                    self.trimmed_tools(spec, sub_ctx.disabled_tools,
+                                       allowed_categories=allowed),
                     stats=stats, stop=parent_stop)) as stream:
                 async for ev in stream:
                     # internal display events are recorded (tagged), not
@@ -448,13 +474,21 @@ def register_delegate_tool(registry, engine: SubagentEngine, *, name: str = "del
 
 
 def make_parallel_delegate_tool(engine: SubagentEngine,
-                                *, name: str = "delegate_parallel") -> tuple[ToolSpec, Any]:
+                                *, name: str = "delegate_parallel",
+                                timeout: float | None = None
+                                ) -> tuple[ToolSpec, Any]:
     """Build the ``delegate_parallel`` tool: fan several subagents out at once.
 
     Each task runs ``engine.delegate`` concurrently (bounded by the engine's
     ``max_parallel``, if set); one failing subagent does not abort the others —
     the result reports per-agent blocks and ``ok`` is True only when all
     succeeded. Categories/META, like ``delegate``.
+
+    ``timeout`` caps EACH task's wall-clock time individually (per task, not
+    per batch, and counted only while running — a task queued behind the
+    ``max_parallel`` semaphore does not burn it): a hung worker is cancelled
+    and reported as that agent's failure block while its siblings keep
+    running, mirroring ``make_delegate_tool``'s timeout semantics.
     """
     roster = engine.roster
 
@@ -498,10 +532,24 @@ def make_parallel_delegate_tool(engine: SubagentEngine,
             if engine.max_parallel else None
 
         async def run_one(item: dict) -> ToolResult:
-            if sem is not None:
-                async with sem:
-                    return await engine.delegate(item, ctx)
-            return await engine.delegate(item, ctx)
+            async def _run() -> ToolResult:
+                if sem is not None:
+                    async with sem:
+                        return await engine.delegate(item, ctx)
+                return await engine.delegate(item, ctx)
+
+            if timeout is None:
+                return await _run()
+            try:
+                return await asyncio.wait_for(_run(), timeout)
+            except asyncio.TimeoutError:
+                # The cancellation deterministically closes the delegation's
+                # inner runtime generator (aclosing in SubagentEngine.run);
+                # siblings are separate gather children and keep running.
+                return ToolResult(
+                    False, "执行超时",
+                    f"子代理 {item['agent']} 执行超时（{timeout:g}s 内未完成），"
+                    f"已被中止；其余子代理不受影响。")
 
         # return_exceptions=True: a *crashed* delegate (store failure, bug —
         # anything escaping as an exception rather than a failed ToolResult)
@@ -559,10 +607,13 @@ def make_parallel_delegate_tool(engine: SubagentEngine,
 def register_delegate_tools(registry, engine: SubagentEngine, *,
                             parallel: bool = True,
                             timeout: float | None = None) -> list[ToolSpec]:
-    """Register ``delegate`` (and by default ``delegate_parallel``) on *registry*."""
+    """Register ``delegate`` (and by default ``delegate_parallel``) on *registry*.
+
+    ``timeout`` applies to both tools: the whole single delegation, and each
+    parallel task individually."""
     specs = [register_delegate_tool(registry, engine, timeout=timeout)]
     if parallel:
-        spec, handler = make_parallel_delegate_tool(engine)
+        spec, handler = make_parallel_delegate_tool(engine, timeout=timeout)
         registry.register(spec, handler)
         specs.append(spec)
     return specs
