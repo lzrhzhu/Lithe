@@ -253,6 +253,124 @@ async def test_search_files_regex_dir_and_glob(tmp_path):
     assert bad.ok is False and "正则" in bad.content
 
 
+async def test_search_files_ignore_case_literal_context_limit(tmp_path):
+    ws = Workspace(tmp_path)
+    reg, _ = _registry_with(ws)
+    ctx = AgentContext(run_id="r", user_id="u")
+
+    # ignore_case：命中大小写混合文本；缺省仍区分大小写
+    ws.write("case.txt", "Hello world\nhello again\nhallo\n")
+    ci = await reg.dispatch("search_files",
+                            {"pattern": "HELLO", "ignore_case": True}, ctx)
+    assert ci.ok and "case.txt:1: Hello world" in ci.content
+    assert "case.txt:2: hello again" in ci.content and "2 处匹配" in ci.summary
+    cs = await reg.dispatch("search_files", {"pattern": "HELLO"}, ctx)
+    assert cs.ok and "未找到匹配" in cs.content
+
+    # literal：元字符按字面匹配，"f(" 这类非法正则也能搜
+    ws.write("lit.txt", "xa.b*cy\nplain\n")
+    lit = await reg.dispatch("search_files",
+                             {"pattern": "a.b*c", "literal": True}, ctx)
+    assert lit.ok and "lit.txt:1: xa.b*cy" in lit.content
+    raw_paren = await reg.dispatch("search_files",
+                                   {"pattern": "f(", "literal": True}, ctx)
+    assert raw_paren.ok, "literal 模式不应走正则编译"
+    re_bad = await reg.dispatch("search_files", {"pattern": "f("}, ctx)
+    assert re_bad.ok is False and "正则" in re_bad.content
+
+    # context=1：邻近命中合并为一个块，非邻接块以 -- 分隔，块外行不出现
+    ws.write("blk.txt", "l1\nhit l2\nl3\nl4\nl5\nhit l6\nl7\n")
+    withctx = await reg.dispatch("search_files",
+                                 {"pattern": "hit", "context": 1}, ctx)
+    assert withctx.ok
+    for frag in ("blk.txt:1: l1", "blk.txt:2: hit l2", "blk.txt:3: l3",
+                 "blk.txt:5: l5", "blk.txt:6: hit l6", "blk.txt:7: l7"):
+        assert frag in withctx.content
+    assert "blk.txt:4" not in withctx.content
+    assert "\n--\n" in withctx.content
+    # 相邻命中（2、3 行）合并：无 -- 分隔
+    ws.write("near.txt", "x\nm1\nm2\ny\n")
+    merged = await reg.dispatch("search_files",
+                                {"pattern": "m", "context": 1}, ctx)
+    assert merged.ok and "\n--\n" not in merged.content
+
+    # limit：截断并如实提示；负数 limit 拒绝
+    ws.write("many.txt", "\n".join(f"term {i}" for i in range(5)) + "\n")
+    lim = await reg.dispatch("search_files",
+                             {"pattern": "term", "limit": 2}, ctx)
+    assert lim.ok and "2 处匹配" in lim.summary
+    assert "仅显示前 2 条" in lim.content
+    assert "term 2" not in lim.content and "term 3" not in lim.content
+    neg = await reg.dispatch("search_files",
+                             {"pattern": "term", "limit": -1}, ctx)
+    assert neg.ok is False and "limit" in neg.content
+
+
+async def test_read_file_directory_listing(tmp_path):
+    ws = Workspace(tmp_path)
+    reg, _ = _registry_with(ws)
+    ctx = AgentContext(run_id="r", user_id="u")
+    ws.write("a.txt", "1")
+    ws.write("code/b.py", "2")
+    ws.new_folder("empty")
+
+    root = await reg.dispatch("read_file", {"path": "."}, ctx)
+    assert root.ok
+    assert "a.txt" in root.content and "code/" in root.content
+    assert "empty/" in root.content and "共 3 项" in root.content
+
+    page = await reg.dispatch("read_file", {"path": ".", "offset": 2, "limit": 1}, ctx)
+    assert page.ok and "2: code/" in page.content
+    assert "1: a.txt" not in page.content and "第 2–2 项" in page.content
+
+    sub = await reg.dispatch("read_file", {"path": "code"}, ctx)
+    assert sub.ok and "b.py" in sub.content
+
+    empty = await reg.dispatch("read_file", {"path": "empty"}, ctx)
+    assert empty.ok and "空目录" in empty.content
+
+    beyond = await reg.dispatch("read_file", {"path": ".", "offset": 9}, ctx)
+    assert beyond.ok and "超出" in beyond.content
+
+
+async def test_read_file_refuses_images_docs_binary(tmp_path):
+    ws = Workspace(tmp_path)
+    reg, _ = _registry_with(ws)
+    ctx = AgentContext(run_id="r", user_id="u")
+
+    # PNG 魔数：拒绝文本读入（不产生替换字符垃圾），指向图像侧信道
+    ws.write_bytes("img.png", b"\x89PNG\r\n\x1a\n" + b"\x00\x10\x20" * 64)
+    img = await reg.dispatch("read_file", {"path": "img.png"}, ctx)
+    assert img.ok is False and img.summary == "图片文件"
+    assert "analyze_image" in img.content
+    assert "\ufffd" not in img.content and len(img.content) < 400  # 无 token 浪费
+
+    # PDF 魔数 / 仅扩展名的 OOXML：指向文档侧信道
+    ws.write_bytes("doc.pdf", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n" + b"x" * 64)
+    pdf = await reg.dispatch("read_file", {"path": "doc.pdf"}, ctx)
+    assert pdf.ok is False and pdf.summary == "文档文件"
+    assert "analyze_document" in pdf.content
+    ws.write_bytes("sheet.docx", b"PK\x03\x04not-really")
+    ext = await reg.dispatch("read_file", {"path": "sheet.docx"}, ctx)
+    assert ext.ok is False and ext.summary == "文档文件"
+
+    # 其它二进制：直接拒绝
+    ws.write_bytes("f.zip", b"PK\x05\x06" + bytes(range(64)))
+    binf = await reg.dispatch("read_file", {"path": "f.zip"}, ctx)
+    assert binf.ok is False and binf.summary == "二进制文件"
+
+    # UTF-16 BOM：报编码问题而不是 mojibake
+    ws.write_bytes("u16.txt", "ÿþH\x00i\x00".encode("latin-1"))
+    u16 = await reg.dispatch("read_file", {"path": "u16.txt"}, ctx)
+    assert u16.ok is False and u16.summary == "编码不支持"
+    assert "UTF-16" in u16.content
+
+    # 魔数优先于扩展名：文本内容顶着 .png 名字照常读
+    ws.write("notes.png", "其实我是文本")
+    plain = await reg.dispatch("read_file", {"path": "notes.png"}, ctx)
+    assert plain.ok and "其实我是文本" in plain.content
+
+
 async def test_glob_files_matches_nested_names(tmp_path):
     ws = Workspace(tmp_path)
     reg, _ = _registry_with(ws)

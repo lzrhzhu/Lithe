@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.9.23 (2026-10-04)
+
+The workspace-tools round: `search_files` gains the options a coding
+agent actually reaches for, and `read_file` stops dumping binary noise
+into model context.
+
+- **`search_files` options** — `ignore_case`, `literal`, `context=N`,
+  `limit`, all optional and combinable. `literal` escapes the pattern so
+  `f(` searches as text instead of failing to compile; `context` expands
+  each hit to grep-`-C`-style blocks (overlapping/adjacent blocks merged,
+  `--` between the rest, clamped 0–10; `context=0` output is
+  byte-identical with the previous format, so `read_file` line-number
+  consumers are unaffected); `limit` caps matching lines (not display
+  lines) with an honest truncation note naming the effective cap.
+- **`read_file` on directories** — a directory `path` now lists one level
+  of entries `ls`-style: subdirectories carry a trailing `/`, symlinks
+  list as opaque names (never followed), ignored names stay hidden, and
+  the same `offset`/`limit` paging applies with a continue-at hint.
+- **`read_file` attachment/binary guard** — a 4096-byte magic-byte sniff
+  runs before any text read: images (jpeg/png/gif/webp) are refused with
+  a pointer to `analyze_image`/`image_info`, PDF/OOXML likewise point at
+  `analyze_document`/`document_info`, other binary content (NUL bytes /
+  >30% control chars) is refused outright, and UTF-16/32 BOM text is
+  reported as an encoding problem instead of passing through
+  `errors="replace"` mojibake. Magic bytes decide — a text file named
+  `notes.png` still reads. Without the guard, one multi-MB image read
+  landed in model context as ~20k replacement-character tokens of pure
+  noise.
+
 ## 0.9.22 (2026-10-03)
 
 A one-field follow-up to 0.9.20's observability round: the *host* run

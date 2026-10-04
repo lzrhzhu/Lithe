@@ -345,7 +345,8 @@ _LINE_NO_PREFIX = re.compile(r"^\s*\d+:\s")
 
 def _path_params() -> dict:
     return {"type": "object",
-            "properties": {"path": {"type": "string", "description": "工作区内相对路径"}},
+            "properties": {"path": {"type": "string",
+                                    "description": "工作区内相对路径（文件或目录）"}},
             "required": ["path"]}
 
 
@@ -392,6 +393,16 @@ def _search_params() -> dict:
                         "description": "只搜索该子目录；省略则搜全部"},
                 "glob": {"type": "string",
                          "description": "文件名过滤，如 *.py；省略不过滤"},
+                "ignore_case": {"type": "boolean",
+                                "description": "忽略大小写匹配；省略则区分大小写"},
+                "literal": {"type": "boolean",
+                            "description": "按纯文本匹配 pattern，不解释正则"
+                                           "（含 . * ( ) 等元字符时用它）"},
+                "context": {"type": "integer",
+                            "description": "每个匹配行前后附带 N 行上下文"
+                                           "（0-10）；省略则只返回匹配行"},
+                "limit": {"type": "integer",
+                          "description": "最多返回的匹配行数；省略用默认上限"},
             },
             "required": ["pattern"]}
 
@@ -402,6 +413,99 @@ def _glob_params() -> dict:
                                        "description": "通配符模式（fnmatch 语法，"
                                                       "如 *.py、data/*.csv）"}},
             "required": ["pattern"]}
+
+
+# --- read_file content sniffing: directory listing + attachment/binary refuse
+#
+# read_file is a TEXT tool. Binary formats must never flow through it as
+# errors="replace" text: a multi-MB image would land in model context as
+# tens of thousands of replacement-character tokens of pure noise. Images
+# and documents get a refusal pointing at their dedicated side-channel
+# tools (analyze_image / analyze_document — one memoized vision call, the
+# answer as text); other binary content is refused outright. Magic bytes
+# decide, extensions only break ties — a text file named notes.png still
+# reads fine.
+
+_SNIFF_BYTES = 4096
+
+_IMAGE_MAGICS: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+_DOC_EXTS = frozenset({".pdf", ".docx", ".xlsx", ".pptx",
+                       ".doc", ".xls", ".ppt", ".odt", ".ods", ".odp"})
+
+
+def _probe_head(target: Path) -> bytes:
+    with open(target, "rb") as fh:
+        return fh.read(_SNIFF_BYTES)
+
+
+def _sniff_attachment(head: bytes, ext: str) -> str | None:
+    """``"image"`` / ``"document"`` for attachment-class files, else None."""
+    if head.startswith(b"%PDF-"):
+        return "document"
+    for magic, _mime in _IMAGE_MAGICS:
+        if head.startswith(magic):
+            return "image"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image"
+    if ext in _DOC_EXTS:
+        return "document"
+    return None
+
+
+def _binary_reason(head: bytes) -> str | None:
+    """None for plain text; a short reason otherwise. UTF-16/32 BOM text is
+    reported as an encoding problem (read_file is UTF-8 only) instead of
+    silently passing through ``errors="replace"`` mojibake."""
+    if head.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return "UTF-32"
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "UTF-16"
+    if b"\x00" in head:
+        return "binary"
+    if head:
+        ctrl = sum(1 for b in head if b < 9 or 13 < b < 32)
+        if ctrl / len(head) > 0.3:
+            return "binary"
+    return None
+
+
+def _read_dir(ws: Workspace, target: Path, rel: str, args: dict) -> ToolResult:
+    """ls-style ONE-LEVEL listing for read_file on a directory, with the same
+    offset/limit paging as file reads. Symlinks list as opaque names (never
+    followed), ignored names stay hidden — the containment rules of
+    walk()/list() apply."""
+    entries: list[str] = []
+    for p in sorted(target.iterdir(), key=lambda q: q.name.lower()):
+        if p.name in ws.ignored:
+            continue
+        if p.is_symlink():
+            entries.append(p.name)
+            continue
+        entries.append(p.name + ("/" if p.is_dir() else ""))
+    total = len(entries)
+    label = rel if rel not in ("", ".", "./") else "."
+    if not total:
+        return ToolResult(True, f"读取目录 {label}", f"{label} 是空目录。")
+    offset = args.get("offset")
+    limit = args.get("limit")
+    start = max(int(offset) - 1, 0) if offset is not None else 0
+    if start >= total:
+        return ToolResult(True, "超出范围",
+                          f"{label} 共 {total} 项，第 {start + 1} 项起已超出末尾。")
+    window = (entries[start:start + int(limit)]
+              if limit is not None else entries[start:])
+    shown = "\n".join(f"{start + j + 1}: {name}"
+                      for j, name in enumerate(window))
+    end = start + len(window)
+    note = f"\n\n（{label} 第 {start + 1}–{end} 项，共 {total} 项）"
+    if end < total:
+        note += f"，继续读用 offset={end + 1}"
+    return ToolResult(True, f"读取目录 {label}（{total} 项）", shown + note)
 
 
 def register_file_tools(
@@ -426,6 +530,49 @@ def register_file_tools(
         if not rel:
             return ToolResult(False, "缺少 path", "缺少 path 参数。")
         ws = workspace_for(ctx)
+        try:
+            target = await asyncio.to_thread(ws.safe_path, rel)
+        except PermissionError as exc:
+            return ToolResult(False, "非法路径", str(exc))
+        if await asyncio.to_thread(target.is_dir):
+            try:
+                return await asyncio.to_thread(_read_dir, ws, target, rel, args)
+            except OSError as exc:
+                return ToolResult(False, "读取目录失败", str(exc))
+        # Sniff BEFORE the text read: an image/PDF/binary must never flow
+        # through errors="replace" — that dumps tens of thousands of
+        # replacement-char tokens of noise into model context.
+        try:
+            head = await asyncio.to_thread(_probe_head, target)
+        except FileNotFoundError:
+            return ToolResult(False, "文件不存在", f"文件不存在：{rel}")
+        except OSError as exc:
+            return ToolResult(False, "读取失败", str(exc))
+        sniff = _sniff_attachment(head, target.suffix.lower())
+        if sniff == "image":
+            return ToolResult(
+                False, "图片文件",
+                f"{rel} 是图片（jpeg/png/gif/webp）。read_file 不读图片内容——"
+                f"那会把二进制当文本灌进上下文，白白消耗大量 token。"
+                f"看图请用 analyze_image（带 question，一次问答）；"
+                f"要尺寸/分辨率等元数据用 image_info。")
+        if sniff == "document":
+            return ToolResult(
+                False, "文档文件",
+                f"{rel} 是文档（PDF/OOXML），read_file 不读文档内容。"
+                f"内容问答用 analyze_document（带 question）；"
+                f"页数/格式等元数据用 document_info。")
+        reason = _binary_reason(head)
+        if reason in ("UTF-16", "UTF-32"):
+            return ToolResult(
+                False, "编码不支持",
+                f"{rel} 是 {reason} 编码文本，read_file 仅支持 UTF-8；"
+                f"请先转码（如 run_command/run_code）后再读。")
+        if reason == "binary":
+            return ToolResult(
+                False, "二进制文件",
+                f"{rel} 是二进制文件，read_file 只读文本。"
+                f"如确需处理，请用沙箱代码解析或向用户说明。")
         try:
             # Disk I/O runs off the event loop (asyncio.to_thread, the same
             # policy as the images/documents bundles): one slow read on a
@@ -595,10 +742,23 @@ def register_file_tools(
         pattern = (args.get("pattern") or "").strip()
         if not pattern:
             return ToolResult(False, "缺少 pattern", "search_files 需要 pattern。")
+        flags = re.IGNORECASE if args.get("ignore_case") else 0
+        source = re.escape(pattern) if args.get("literal") else pattern
         try:
-            rx = re.compile(pattern)
+            rx = re.compile(source, flags)
         except re.error as exc:
             return ToolResult(False, "正则无效", f"pattern 不是合法正则：{exc}")
+        context = args.get("context") or 0
+        limit = args.get("limit") or 0
+        try:
+            context = min(max(int(context), 0), 10)
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult(False, "参数错误", "context/limit 需要整数。")
+        if limit < 0:
+            return ToolResult(False, "参数错误", "limit 不能为负。")
+        max_matches = min(limit, _SEARCH_MAX_MATCHES) if limit \
+            else _SEARCH_MAX_MATCHES
         rel_dir = (args.get("dir") or "").strip()
         name_pat = (args.get("glob") or "").strip()
         ws = workspace_for(ctx)
@@ -610,11 +770,36 @@ def register_file_tools(
         if rel_dir and not await asyncio.to_thread(base.is_dir):
             return ToolResult(False, "目录不存在", f"目录不存在：{rel_dir}")
         prefix = rel_dir.rstrip("/") + "/" if rel_dir else ""
-        matches: list[str] = []
+        out: list[str] = []          # display lines (matches + context)
+        hit_total = 0                # matching LINES (what limit caps)
         truncated = False
         deadline = time.monotonic() + _SEARCH_TIME_BUDGET
         scanned = skipped_binary = skipped_big = skipped_long = 0
         out_of_time = False
+
+        def _emit(rel: str, lines: list[str], hits: list[int]) -> None:
+            """Append grep-style output for one file: each hit expanded to a
+            [hit-context, hit+context] block, overlapping/adjacent blocks
+            merged, ``--`` between the rest (context=0 → bare hit lines,
+            byte-identical with the pre-context output format)."""
+            nonlocal skipped_long
+            n = len(lines)
+            blocks: list[list[int]] = []
+            for ln in hits:
+                lo, hi = max(1, ln - context), min(n, ln + context)
+                if blocks and lo <= blocks[-1][1] + 1:
+                    blocks[-1][1] = max(hi, blocks[-1][1])
+                else:
+                    blocks.append([lo, hi])
+            for bi, (lo, hi) in enumerate(blocks):
+                if bi and context:
+                    out.append("--")
+                for ln in range(lo, hi + 1):
+                    line = lines[ln - 1]
+                    if len(line) > _SEARCH_MAX_LINE:
+                        skipped_long += 1
+                        continue
+                    out.append(f"{rel}:{ln}: {line.strip()[:_MATCH_LINE_CAP]}")
 
         def _collect():
             # The walk itself is disk-bound (a full sorted rglob of the
@@ -654,7 +839,9 @@ def register_file_tools(
                 if "\x00" in text[:1024]:
                     skipped_binary += 1
                     continue
-                for lineno, line in enumerate(text.splitlines(), 1):
+                lines = text.splitlines()
+                hits: list[int] = []
+                for lineno, line in enumerate(lines, 1):
                     if (lineno % _SEARCH_YIELD_EVERY == 0
                             and time.monotonic() > deadline):
                         out_of_time = True
@@ -663,16 +850,18 @@ def register_file_tools(
                         skipped_long += 1
                         continue
                     if rx.search(line):
-                        if len(matches) >= _SEARCH_MAX_MATCHES:
+                        if hit_total >= max_matches:
                             truncated = True
                             break
-                        matches.append(
-                            f"{rel}:{lineno}: {line.strip()[:_MATCH_LINE_CAP]}")
+                        hits.append(lineno)
+                        hit_total += 1
+                if hits:
+                    _emit(rel, lines, hits)
                 if out_of_time or truncated:
                     break
             if out_of_time or truncated:
                 break
-        if not matches:
+        if not out:
             notes = [f"扫描 {scanned} 个文件"]
             if skipped_binary:
                 notes.append(f"跳过二进制 {skipped_binary}")
@@ -684,18 +873,18 @@ def register_file_tools(
                 notes.append("已达时间上限，扫描未完成")
             return ToolResult(True, "无匹配" if not out_of_time else "未扫完",
                               f"未找到匹配（{'，'.join(notes)}）。")
-        body = "\n".join(matches)
+        body = "\n".join(out)
         notes = []
         if truncated:
-            notes.append(f"匹配过多，仅显示前 {_SEARCH_MAX_MATCHES} 条；"
-                         f"请收窄 pattern 或用 glob 过滤")
+            notes.append(f"匹配过多，仅显示前 {max_matches} 条；"
+                         f"请收窄 pattern、加 limit 或用 glob 过滤")
         if out_of_time:
             notes.append("已达扫描时间上限，结果可能不完整；请用 dir/glob 收窄范围")
         if skipped_long:
             notes.append(f"跳过 {skipped_long} 条超长行（>10k 字符）")
         if notes:
             body += "\n…（" + "；".join(notes) + "）"
-        return ToolResult(True, f"{len(matches)} 处匹配", f"匹配结果：\n{body}")
+        return ToolResult(True, f"{hit_total} 处匹配", f"匹配结果：\n{body}")
 
     async def glob_files(ctx, args):
         pattern = (args.get("pattern") or "").strip()
@@ -747,7 +936,11 @@ def register_file_tools(
 
     registry.register(
         ToolSpec("read_file", "读取工作区内一个文件的内容，每行带 行号: 前缀"
-                              "（大文件可用 offset/limit 分行阅读）。",
+                              "（大文件可用 offset/limit 分行阅读）；"
+                              "path 为目录时列出一层条目（子目录带 / 后缀，"
+                              "同样支持 offset/limit 分页）。"
+                              "图片/PDF/二进制会被拒绝并提示改用 "
+                              "analyze_image / analyze_document 等专用工具。",
                  _read_params(), ToolCategory.READ),
         read_file)
     registry.register(
@@ -767,7 +960,10 @@ def register_file_tools(
         list_files)
     registry.register(
         ToolSpec("search_files", "在工作区文件内容中按正则搜索，返回 path:行号: 行。"
-                                 "可用 dir 限定子目录、glob 过滤文件名。"
+                                 "可用 dir 限定子目录、glob 过滤文件名；"
+                                 "ignore_case 忽略大小写，literal 按纯文本匹配，"
+                                 "context=N 附带匹配行前后各 N 行（块间以 -- 分隔），"
+                                 "limit 限制返回条数。"
                                  "超长行（>10k 字符）会被跳过。",
                  _search_params(), ToolCategory.READ,
                  timeout=30.0),
