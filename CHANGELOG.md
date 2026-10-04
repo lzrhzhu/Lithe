@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.9.24 (2026-10-04)
+
+The dangerous-command guard: `run_command` gains a pre-execution policy
+layer. Catastrophic commands never run; destructive-but-scoped ones
+require a human yes first.
+
+- **`classify_command` / `make_command_guard`** (`lithe.bundles.command`) —
+  a pure, dialect-agnostic classifier (bash / PowerShell / cmd) plus a
+  pre-dispatch middleware factory for `run_command`. Three verdicts:
+  **"deny"** — recursive deletion aimed at a filesystem anchor (`/`, `~`,
+  `.`, `..`, `*`, `$HOME`, system trees, drive roots), `mkfs`, `dd` to a
+  device, `format c:`, `shutdown`, fork bombs — refused outright, no
+  approver can override. **"approve"** — `rm -r` on a scoped path,
+  `sudo`, `git push --force`, `git reset --hard`, `git clean -f`, broad
+  kills, `curl | sh`, `chmod -R`, `crontab -r` … — runs only when the
+  host-supplied async approver returns True; without an approver channel
+  the call is denied with guidance to hand it to the user, so an
+  unattended agent never runs destructive operations silently. Anything
+  else runs as before. The recursive-deleter family (`rm` / `rd` /
+  `del` / `Remove-Item` / `chmod` / `chown`) is analyzed token-wise with
+  per-dialect flag syntax (`-r` vs `/s`), so `rm -rf /usr` keeps `/usr`
+  a target rather than a flag, and `git push --force-with-lease` stays
+  unflagged. The `run_command` tool description now tells the model the
+  guard exists and not to retry a refused command verbatim.
+
 ## 0.9.23 (2026-10-04)
 
 The workspace-tools round: `search_files` gains the options a coding
