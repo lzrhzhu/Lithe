@@ -1,11 +1,26 @@
 # Changelog
 
-## 0.9.26 (2026-10-04)
+## 0.9.3 (2026-10-04)
+
+Renumbered baseline: the earlier 0.9.x cadence published twenty releases
+in five days, so the PyPI history was cleaned up (old releases deleted;
+their version numbers and filenames are permanently retired by PyPI) and
+the published line restarts here at a saner pace. This release contains
+everything from the rounds previously numbered 0.9.25 and 0.9.26.
 
 The parallel-safety round: parallel subagents can no longer silently
 clobber each other's writes, `delegate_parallel` gains per-task timeouts,
-and delegation can no longer widen a restricted mode's powers.
+and delegation can no longer widen a restricted mode's powers. Plus the
+todos localization round.
 
+- **`update_todos` / `list_todos` descriptions localized** — the tool
+  descriptions and the `todos` schema texts (array guidance, item
+  content/status/priority) were the only English on an otherwise
+  all-Chinese tool surface; mixed languages dilute instruction weight
+  for models that anchor on the system prompt's language. The guidance
+  is preserved one-to-one (optional planning tool; read before replace;
+  send the COMPLETE list, not a delta; at most one in_progress; never a
+  fixed count) — only the language changed.
 - **run-wide file-mutation lock + write generations** (`lithe.bundles.workspace`)
   — the stale-content guard was check-then-act with an `await` between the
   check and the write, so two parallel subagents writing the same file
@@ -42,20 +57,6 @@ and delegation can no longer widen a restricted mode's powers.
   still delegate research to read-only workers, but can no longer hand a
   write-capable coder subagent the pen. Direct `engine.run` callers
   without a stashed mode keep the declared roster unchanged.
-
-## 0.9.25 (2026-10-04)
-
-The prompt-consistency round: the todos bundle's model-facing text is now
-Chinese, like every other bundled tool.
-
-- **`update_todos` / `list_todos` descriptions localized** — the tool
-  descriptions and the `todos` schema texts (array guidance, item
-  content/status/priority) were the only English on an otherwise
-  all-Chinese tool surface; mixed languages dilute instruction weight
-  for models that anchor on the system prompt's language. The guidance
-  is preserved one-to-one (optional planning tool; read before replace;
-  send the COMPLETE list, not a delta; at most one in_progress; never a
-  fixed count) — only the language changed.
 
 ## 0.9.24 (2026-10-04)
 

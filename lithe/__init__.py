@@ -16,7 +16,7 @@ Layout:
 """
 # Single source of truth for the package version; pyproject reads it via
 # [tool.setuptools.dynamic] (statically, without importing this module).
-__version__ = "0.9.26"
+__version__ = "0.9.3"
 
 from lithe.actions import (  # noqa: F401
     Action, Reverter, UndoEngine, UndoReport,
