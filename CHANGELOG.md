@@ -1,12 +1,14 @@
 # Changelog
 
-## 0.9.3 (2026-10-04)
+## 0.1.0 (2026-10-04)
 
-Renumbered baseline: the earlier 0.9.x cadence published twenty releases
-in five days, so the PyPI history was cleaned up (old releases deleted;
-their version numbers and filenames are permanently retired by PyPI) and
-the published line restarts here at a saner pace. This release contains
-everything from the rounds previously numbered 0.9.25 and 0.9.26.
+Clean renumber: every earlier PyPI release (the whole 0.9.x line,
+including a briefly published 0.9.3) was deleted at the maintainer's
+request; PyPI permanently retires deleted version numbers and filenames,
+so the published line restarts at the lowest conventional version. This
+release contains all development to date — the todos localization and
+parallel-safety rounds previously numbered 0.9.25/0.9.26, plus every
+round in the history below.
 
 The parallel-safety round: parallel subagents can no longer silently
 clobber each other's writes, `delegate_parallel` gains per-task timeouts,
