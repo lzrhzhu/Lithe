@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.2 (2026-10-05)
+
+The parallel-duplicates round plus a maintenance pass: `delegate_parallel`
+no longer rejects a batch that gives one subagent several tasks, the
+kernel's context-trimming logic moves to its own module, and both
+repositories gain a build-validation gate in CI and publish.
+
+- **`delegate_parallel` accepts same-agent duplicates** (`lithe.bundles.subagents`)
+  — session logs showed the model naturally assigning one subagent (e.g.
+  researcher) two tasks in a single fan-out, and the old guard rejected
+  the whole batch with `重复子代理`, forcing extra rounds of merging or
+  re-calling. Tasks on the same agent now run sequentially in listed
+  order while distinct agents stay concurrent: the snapshot-diff action
+  attribution (a delegation's mutations = "actions new since this
+  subagent's pre-run snapshot") keeps its one-live-task-per-agent
+  invariant, so summaries and undo labels cannot cross-claim. Queueing
+  behind a same-agent predecessor does not burn the per-task timeout, a
+  crashed predecessor does not doom its queued sibling, and parent
+  cancellation still propagates.
+- **`lithe.context_window` extracted** — the context-trimming constants,
+  sizing and stage/drop logic moved out of `lithe.runtime` into their own
+  module (runtime imports them back; `lithe.runtime._OMITTED_TURNS_NOTE`
+  & co. remain importable for existing callers and tests).
+- **release gate** — `scripts/check_release.py` builds isolated wheel +
+  sdist, verifies PEP 625 artifact names and Name/Version metadata against
+  the source `__version__` (line-ending agnostic — setuptools writes CRLF
+  METADATA on Windows), runs `twine check --strict`, and can clean stale
+  `build/` / `dist/` / `.egg-info` (`--clean-only`); CI and the publish
+  workflow run it before upload.
+
 ## 0.1.1 (2026-10-05)
 
 The search_files single-file round: session logs showed models routinely

@@ -482,6 +482,52 @@ async def test_delegate_parallel_validates_batch_and_agents(tmp_path):
     assert empty.ok is False
 
 
+async def test_delegate_parallel_same_agent_tasks_run_sequentially(tmp_path):
+    """同一子代理出现在 tasks 多项：批次必须整体成功，且该代理的任务
+    按列出顺序串行执行（互相交错会因快照差集记账而错认动作归属——
+    旧行为是整批拒绝，模型被迫多轮重试）。"""
+    import asyncio
+
+    log: list[tuple[str, int]] = []
+
+    async def probe(ctx, args):
+        log.append(("enter", args["n"]))
+        await asyncio.sleep(0.05)  # 足够让并发的同类任务交错
+        log.append(("exit", args["n"]))
+        return ToolResult(True, "probe", f"probe {args['n']}")
+
+    store = JsonlRunStore(tmp_path)
+    reg = ToolRegistry()
+    reg.register(ToolSpec("probe", "p", category=ToolCategory.READ), probe)
+
+    # 一个 transport 顺序服务同一代理的两次运行（每次 2 个响应）
+    responses = []
+    for n in (1, 2):
+        responses.append({"choices": [{"message": {
+            "content": "",
+            "tool_calls": [_tc("probe", {"n": n}, cid=f"c{n}")]}}]})
+        responses.append({"choices": [{"message": {"content": f"done {n}"}}]})
+
+    host = AgentHost(reg, LLMConfig(model="m", base_url="x", api_key="k",
+                                    transport=_chat_transport(responses)), store)
+    roster = SubagentRoster([
+        SubagentSpec("sa", "A", "does a", ["probe"], "p"),
+    ])
+    engine = SubagentEngine(host, roster)
+    ctx = AgentContext(run_id="r1", user_id="u1")
+    store.create_run("r1", "u1", "t")
+
+    from lithe.bundles import make_parallel_delegate_tool
+    _, handler = make_parallel_delegate_tool(engine)
+    res = await asyncio.wait_for(handler(ctx, {"tasks": [
+        {"agent": "sa", "task": "one"}, {"agent": "sa", "task": "two"}]}), 5.0)
+    assert res.ok, "同名两任务串行执行，批次整体成功"
+    assert "2 成功" in res.summary
+    assert res.content.count("### sa（成功）") == 2
+    # 完全串行：第 2 项的 enter 必须晚于第 1 项的 exit
+    assert log == [("enter", 1), ("exit", 1), ("enter", 2), ("exit", 2)]
+
+
 async def test_subagent_progress_callback_gets_live_events(tmp_path):
     transport = _chat_transport([
         {"choices": [{"message": {"content": "",

@@ -24,3 +24,9 @@ jobs:
         run: python -m pytest -q
       - name: Offline example
         run: python examples/minimal_host.py
+      - name: Build and validate release artifacts
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: |
+          python scripts/check_release.py --distribution lithe --package lithe --clean-only
+          python -m pip install build twine
+          python scripts/check_release.py --distribution lithe --package lithe

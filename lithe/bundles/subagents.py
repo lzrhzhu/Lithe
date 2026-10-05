@@ -479,10 +479,12 @@ def make_parallel_delegate_tool(engine: SubagentEngine,
                                 ) -> tuple[ToolSpec, Any]:
     """Build the ``delegate_parallel`` tool: fan several subagents out at once.
 
-    Each task runs ``engine.delegate`` concurrently (bounded by the engine's
-    ``max_parallel``, if set); one failing subagent does not abort the others —
-    the result reports per-agent blocks and ``ok`` is True only when all
-    succeeded. Categories/META, like ``delegate``.
+    Distinct agents' tasks run ``engine.delegate`` concurrently (bounded by
+    the engine's ``max_parallel``, if set); several tasks on the SAME agent
+    run sequentially in listed order (one live delegation per agent — see
+    the chaining note in the handler). One failing subagent does not abort
+    the others — the result reports per-agent blocks and ``ok`` is True only
+    when all succeeded. Categories/META, like ``delegate``.
 
     ``timeout`` caps EACH task's wall-clock time individually (per task, not
     per batch, and counted only while running — a task queued behind the
@@ -504,7 +506,6 @@ def make_parallel_delegate_tool(engine: SubagentEngine,
                               f"一次最多并行委派 {engine.max_batch} 项，"
                               f"收到 {len(tasks)} 项。")
         items: list[dict] = []
-        seen_agents: set[str] = set()
         for t in tasks:
             if not isinstance(t, dict):
                 return ToolResult(False, "参数错误", "tasks 每项必须是对象。")
@@ -512,16 +513,6 @@ def make_parallel_delegate_tool(engine: SubagentEngine,
             if agent not in roster:
                 return ToolResult(False, "委派失败",
                                   f"未知子代理 {agent!r}，可选：\n" + roster.text())
-            if agent in seen_agents:
-                # Two parallel tasks on one agent share the subagent tag, so
-                # each would claim the other's actions in its "new since
-                # snapshot" set — attribute the work to the wrong summary
-                # and double-count it in undo labels.
-                return ToolResult(False, "重复子代理",
-                                  f"tasks 中子代理 {agent} 出现多次；同一子代理"
-                                  f"一次只能承接一项并行任务，请合并任务或"
-                                  f"分多次调用。")
-            seen_agents.add(agent)
             task = (t.get("task") or "").strip()
             if not task:
                 return ToolResult(False, "委派失败",
@@ -551,12 +542,38 @@ def make_parallel_delegate_tool(engine: SubagentEngine,
                     f"子代理 {item['agent']} 执行超时（{timeout:g}s 内未完成），"
                     f"已被中止；其余子代理不受影响。")
 
+        # Same-agent tasks run sequentially (in listed order), distinct
+        # agents concurrently. SubagentEngine.run attributes a delegation's
+        # mutations as "actions new since this subagent's pre-run snapshot";
+        # two same-named instances in flight would each claim the other's
+        # work in summaries and undo labels. Chaining preserves the
+        # one-live-task-per-agent invariant without rejecting the batch —
+        # and, like the semaphore queue above, waiting for a predecessor
+        # does not burn the per-task timeout (it counts only while running).
+        prev_by_agent: dict[str, asyncio.Task] = {}
+
+        async def run_after(prev: asyncio.Task | None, item: dict) -> ToolResult:
+            if prev is not None:
+                try:
+                    await prev
+                except asyncio.CancelledError:
+                    raise  # parent cancellation must keep flowing
+                except BaseException:  # noqa: BLE001 — a crashed predecessor
+                    pass               # must not doom the queued sibling
+            return await run_one(item)
+
+        futures: list[asyncio.Task] = []
+        for it in items:
+            fut = asyncio.ensure_future(
+                run_after(prev_by_agent.get(it["agent"]), it))
+            prev_by_agent[it["agent"]] = fut
+            futures.append(fut)
+
         # return_exceptions=True: a *crashed* delegate (store failure, bug —
         # anything escaping as an exception rather than a failed ToolResult)
         # must not abort its siblings mid-flight, which would also leave them
         # running as unawaited orphans. Crashes are reported per agent below.
-        outcomes = await asyncio.gather(*[run_one(it) for it in items],
-                                        return_exceptions=True)
+        outcomes = await asyncio.gather(*futures, return_exceptions=True)
         blocks = []
         succeeded = 0
         ui: list[dict] = []
@@ -579,8 +596,10 @@ def make_parallel_delegate_tool(engine: SubagentEngine,
 
     spec = ToolSpec(
         name,
-        "把多项独立工作并行委派给多个子代理（各在隔离上下文里完成）。任务之间"
-        "必须互不依赖；返回每个子代理的完成摘要。适合扇出检索/多方案生成。",
+        "把多项独立工作并行委派给多个子代理（各在隔离上下文里完成）。不同"
+        "子代理的任务并行执行；同一子代理的多项任务按列出顺序串行执行，"
+        "无需合并或拆分调用。任务之间必须互不依赖；返回每个子代理的完成"
+        "摘要。适合扇出检索/多方案生成。",
         {"type": "object",
          "properties": {
              "tasks": {

@@ -335,7 +335,9 @@ def test_thin_event_caps_args_and_summary():
     assert len(thin["error"]) <= 301
 
 
-async def test_delegate_parallel_rejects_duplicate_agents(tmp_path):
+async def test_delegate_parallel_accepts_duplicate_agents(tmp_path):
+    """同一子代理的多项任务不再整批拒绝：按列出顺序串行执行，批次成功。
+    （旧契约是返回"重复子代理"错误，模型被迫合并任务或拆成多次调用。）"""
     from lithe.bundles import JsonlRunStore, SubagentEngine, SubagentRoster
     from lithe.bundles.subagents import (SubagentSpec,
                                             make_parallel_delegate_tool)
@@ -344,7 +346,8 @@ async def test_delegate_parallel_rejects_duplicate_agents(tmp_path):
     host_like = SimpleNamespace(
         registry=reg,
         llm_config=LLMConfig(model="m", base_url="x", api_key="k",
-                             transport=_FakeTransport([])),
+                             transport=_FakeTransport([_resp("done a"),
+                                                       _resp("done b")])),
         store=store, context_budget=None, strict_records=False,
         max_cost=None, max_total_tokens=None, repeat_call_limit=None,
         max_steps=2, http_client=None)
@@ -353,8 +356,9 @@ async def test_delegate_parallel_rejects_duplicate_agents(tmp_path):
     spec, handler = make_parallel_delegate_tool(engine)
     res = await handler(_ctx(), {"tasks": [
         {"agent": "w", "task": "a"}, {"agent": "w", "task": "b"}]})
-    assert not res.ok
-    assert "重复" in res.content or "多次" in res.content
+    assert res.ok
+    assert "重复" not in res.content
+    assert res.content.count("### w（成功）") == 2
 
 
 def test_subagent_engine_roster_is_read_only():
