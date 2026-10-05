@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.1 (2026-10-05)
+
+The search_files single-file round: session logs showed models routinely
+passing an existing FILE path as `search_files`' `dir=` (e.g.
+`dir="pkg/module.py"`), and the tool answered `目录不存在` for a path
+that plainly exists — the model then retried sibling directories and
+never converged (16 of the 79 failed tool calls in one local session
+store had exactly this shape). `dir=` naming a file now greps just that
+file.
+
+- **`search_files` `dir=` accepts a file** (`lithe.bundles.workspace`) —
+  when `dir=` resolves to an existing file, the search runs inside that
+  single file (`glob` is meaningless there and is ignored); only a path
+  that exists nowhere still reports `目录不存在`.
+
 ## 0.1.0 (2026-10-04)
 
 Clean renumber: every earlier PyPI release (the whole 0.9.x line,

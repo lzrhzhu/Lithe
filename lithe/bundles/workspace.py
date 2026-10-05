@@ -862,9 +862,16 @@ def register_file_tools(
                     if rel_dir else ws.root)
         except PermissionError as exc:
             return ToolResult(False, "非法路径", str(exc))
-        if rel_dir and not await asyncio.to_thread(base.is_dir):
+        # dir= naming an existing FILE means "grep just this file" — the
+        # logs show models routinely pass one (search_files with
+        # dir="pkg/module.py"), and answering "目录不存在" for a path
+        # that exists sends them into wrong-directory retry loops.
+        single_file = bool(rel_dir) and await asyncio.to_thread(base.is_file)
+        if rel_dir and not single_file \
+                and not await asyncio.to_thread(base.is_dir):
             return ToolResult(False, "目录不存在", f"目录不存在：{rel_dir}")
-        prefix = rel_dir.rstrip("/") + "/" if rel_dir else ""
+        prefix = (rel_dir.rstrip("/") + "/"
+                  if rel_dir and not single_file else "")
         out: list[str] = []          # display lines (matches + context)
         hit_total = 0                # matching LINES (what limit caps)
         truncated = False
@@ -897,6 +904,9 @@ def register_file_tools(
                     out.append(f"{rel}:{ln}: {line.strip()[:_MATCH_LINE_CAP]}")
 
         def _collect():
+            if single_file:
+                # glob 名单文件模式下无意义，直接忽略。
+                return [(rel_dir, base)]
             # The walk itself is disk-bound (a full sorted rglob of the
             # tree); filtering is pure Python and rides along for free.
             return [(rel, p) for rel, p in ws.walk()

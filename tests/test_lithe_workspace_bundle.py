@@ -252,6 +252,20 @@ async def test_search_files_regex_dir_and_glob(tmp_path):
     bad = await reg.dispatch("search_files", {"pattern": "a("}, ctx)
     assert bad.ok is False and "正则" in bad.content
 
+    # dir= 指向一个已存在的文件：等价于“只 grep 这个文件”，而不是报
+    # “目录不存在”（路径明明存在——那条假错误会把模型逼进改目录的
+    # 重试循环）。glob 在单文件模式下被忽略。
+    as_file = await reg.dispatch("search_files",
+                                 {"pattern": "beta", "dir": "code/a.py",
+                                  "glob": "*.md"}, ctx)
+    assert as_file.ok and "code/a.py:2: beta = 2" in as_file.content
+    assert "alpha" not in as_file.content  # 只搜该文件，不含同文件其它行以外的输出
+    assert "notes/" not in as_file.content and "b.py" not in as_file.content
+
+    miss = await reg.dispatch("search_files",
+                              {"pattern": "beta", "dir": "code/nope.py"}, ctx)
+    assert miss.ok is False and "目录不存在" in miss.content
+
 
 async def test_search_files_ignore_case_literal_context_limit(tmp_path):
     ws = Workspace(tmp_path)
