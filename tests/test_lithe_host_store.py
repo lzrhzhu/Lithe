@@ -177,6 +177,11 @@ async def test_host_run_error_funneled(tmp_path, monkeypatch):
     assert any(e["type"] == EventType.ERROR for e in events)
     assert events[-1]["type"] == EventType.DONE and events[-1]["status"] == "failed"
     assert store.get_run("r9", "u1").status == "failed"
+    # the diagnostic persists on the run row and rides the done event, so a
+    # post-mortem (or a later session reading the store) can say why
+    assert store.get_run("r9", "u1").error == "RuntimeError: boom"
+    assert events[-1].get("error") == "RuntimeError: boom"
+    assert "boom" in [e for e in events if e["type"] == EventType.ERROR][-1]["message"]
 
 
 async def test_host_run_abandoned_midstream_closes_run(tmp_path):

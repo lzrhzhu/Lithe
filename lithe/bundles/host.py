@@ -304,12 +304,14 @@ class AgentHost:
             completion_tokens=kstats.completion_tokens or None,
             cached_tokens=kstats.cached_tokens or None,
             total_tokens=kstats.total_tokens or None,
+            error=kstats.error,
         )
         if stats is not None:
             stats.update(
                 {
                     "final_text": kstats.final_text,
                     "status": kstats.status,
+                    "error": kstats.error,
                     "last_step": kstats.last_step,
                     "total_cost": kstats.total_cost,
                     "total_tokens": kstats.total_tokens,
@@ -416,6 +418,7 @@ class AgentHost:
                         yield ev
             except Exception as exc:  # noqa: BLE001
                 kstats.status = "failed"
+                kstats.error = f"{type(exc).__name__}: {exc}"
                 yield {"type": EventType.ERROR, "message": f"运行出错：{exc}"}
 
             # Subagent spend folds into the run totals before closing: the
@@ -429,6 +432,7 @@ class AgentHost:
             # error event, run closed ``failed`` — instead of escaping the
             # generator and stranding the run at ``running``.
             kstats.status = "failed"
+            kstats.error = f"{type(exc).__name__}: {exc}"
             yield {"type": EventType.ERROR, "message": f"运行出错：{exc}"}
             sub = ctx.shared.get("_subagent_usage") or {}
         except BaseException:
@@ -468,6 +472,11 @@ class AgentHost:
             "duration_s": kstats.duration_s,
             "status": kstats.status,
         }
+        if kstats.error:
+            # The failed-run diagnostic rides the done event too, so
+            # front-ends and event-fed stores can surface the cause without
+            # re-reading the run row.
+            done["error"] = kstats.error
         if sub.get("delegations"):
             done["subagent_delegations"] = int(sub["delegations"])
             done["subagent_cost"] = round(sub_cost, 6)

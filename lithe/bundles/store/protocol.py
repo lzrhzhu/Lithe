@@ -60,6 +60,12 @@ class StoredAction:
 class StoredRun:
     """One agent run (one turn of a conversation).
 
+    ``run_id`` / ``user_id`` / ``task`` / ``status`` / ``final`` / ``error`` /
+    ``steps`` / ``cost`` plus token fields. ``error`` is the diagnostic of a
+    failed run (exception class + message from the runtime, capped) —
+    ``None`` on every other path, so a post-mortem over stored runs can say
+    *why* something failed without the process's stderr log.
+
     ``created_at`` / ``finished_at`` are unix epoch floats (the store stamps
     them automatically; legacy rows read back as ``None``). The token fields
     are the run's cumulative usage as reported by the final ``done`` state —
@@ -72,6 +78,7 @@ class StoredRun:
     task: str
     status: str = "running"
     final: str | None = None
+    error: str | None = None
     conversation_id: int | None = None
     model: str | None = None
     steps: int = 0
@@ -117,6 +124,7 @@ class RunStore(Protocol):
         cached_tokens: int | None = None,
         total_tokens: int | None = None,
         finished_at: float | None = None,
+        error: str | None = None,
     ) -> None: ...
 
     def get_run(self, run_id: str, user_id: str) -> StoredRun | None: ...

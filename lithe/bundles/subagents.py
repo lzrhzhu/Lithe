@@ -352,9 +352,19 @@ class SubagentEngine:
             head = f"【子代理 {spec.display} 已随本次运行取消】"
         elif stats.status == "budget_exceeded":
             head = f"【子代理 {spec.display} 因超出预算中止】"
+        elif stats.status == "empty_response":
+            head = f"【子代理 {spec.display} 未返回任何结果】"
         else:
             head = f"【子代理 {spec.display} 已完成】"
         parts = [head]
+        if stats.error:
+            # The diagnostic (exception class + message, set by the runtime
+            # on every failed / empty model call) belongs in the summary the
+            # orchestrator's model reads: without it a failed delegation
+            # reads as an unexplained "运行失败", and the model cannot tell
+            # a transient gateway error (worth one retry) from a task that
+            # genuinely cannot run.
+            parts.append(f"失败原因：{stats.error}")
         final = (stats.final_text or "").strip()
         if final:
             parts.append(final)

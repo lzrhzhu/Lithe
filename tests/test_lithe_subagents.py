@@ -231,6 +231,37 @@ async def test_engine_high_water_with_opaque_string_ids(tmp_path):
         "第二次委派的新动作按 id 集合成员关系识别，而非数值比较"
 
 
+async def test_failed_delegation_summary_carries_reason(tmp_path):
+    """失败的委派必须把失败原因带回编排者的工具结果：只写“运行失败”时，
+    模型无法区分瞬时网关错误（值得重试一次）与任务本身无法执行——这正是
+    会话存储里“1 成功 1 失败”之后无从排查的原因。"""
+    import httpx
+
+    class _NetDown:
+        async def complete(self, client, **kw):
+            raise httpx.ConnectError("upstream refused")
+
+    store, reg, host, roster, engine = _build(tmp_path, transport=_NetDown())
+    store.create_run("r1", "u1", "t")
+    ctx = AgentContext(run_id="r1", user_id="u1")
+
+    stats, sub_actions = await engine.run("writer", "write something", ctx)
+    assert stats.status == "failed" and sub_actions == []
+    assert stats.error == "ConnectError: upstream refused"
+    s = engine.summarize(roster.get("writer"), stats, sub_actions)
+    assert "运行失败" in s
+    assert "失败原因：ConnectError: upstream refused" in s
+    r = await engine.delegate({"agent": "writer", "task": "t"}, ctx)
+    assert r.ok is False
+    assert "ConnectError: upstream refused" in r.content
+
+    # empty_response keeps its own honest head (not 已完成) + the reason
+    from lithe import RunStats as _RS
+    s2 = engine.summarize(roster.get("writer"), _RS(status="empty_response",
+                                                    error="model returned nothing"), [])
+    assert "未返回任何结果" in s2 and "失败原因" in s2
+
+
 async def test_subagent_cancellation_propagates_from_parent_run(tmp_path):
     """编排者的 stop 句柄（run 期间写入 ctx.shared）必须同样终止子代理：
     取消后子代理不再调用模型，状态如实标记。"""

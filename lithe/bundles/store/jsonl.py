@@ -138,17 +138,22 @@ class JsonlRunStore:
     def finish_run(self, run_id, status, steps, cost, final, *,
                    prompt_tokens=None, completion_tokens=None,
                    cached_tokens=None, total_tokens=None,
-                   finished_at=None) -> None:
+                   finished_at=None, error=None) -> None:
         """Close a run; token fields are optional and additive (legacy rows
-        written without them read back as ``None`` — "unknown", not zero)."""
-        self._append(self._runs, {"kind": "run_final", "run_id": run_id,
-                                  "status": status, "steps": steps,
-                                  "cost": cost, "final": final,
-                                  "prompt_tokens": prompt_tokens,
-                                  "completion_tokens": completion_tokens,
-                                  "cached_tokens": cached_tokens,
-                                  "total_tokens": total_tokens,
-                                  "finished_at": finished_at or time.time()})
+        written without them read back as ``None`` — "unknown", not zero).
+        ``error`` is the failed-run diagnostic (see protocol.StoredRun);
+        written only when set so legacy lines stay shape-identical."""
+        row = {"kind": "run_final", "run_id": run_id,
+               "status": status, "steps": steps,
+               "cost": cost, "final": final,
+               "prompt_tokens": prompt_tokens,
+               "completion_tokens": completion_tokens,
+               "cached_tokens": cached_tokens,
+               "total_tokens": total_tokens,
+               "finished_at": finished_at or time.time()}
+        if error is not None:
+            row["error"] = error
+        self._append(self._runs, row)
 
     def _fold_runs(self, user_id):
         """Return ``(by_id, order)`` of StoredRun for *user_id*, newest state wins.
@@ -183,6 +188,8 @@ class JsonlRunStore:
                 # None and a tokenless finish stays honestly None.
                 if ln.get("finished_at") is not None:
                     r.finished_at = ln["finished_at"]
+                if ln.get("error") is not None:
+                    r.error = ln["error"]
                 for f in ("prompt_tokens", "completion_tokens",
                           "cached_tokens", "total_tokens"):
                     if ln.get(f) is not None:

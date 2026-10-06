@@ -31,6 +31,21 @@ def test_finish_run_persists_token_fields(tmp_path):
     assert (run.cached_tokens, run.total_tokens) == (8, 120)
 
 
+def test_finish_run_persists_error_diagnostic(tmp_path):
+    """失败 run 的诊断（异常类+消息）必须落进 run_final 行并能折回——
+    事后排查不能依赖当时的 stderr 日志。"""
+    s = JsonlRunStore(tmp_path)
+    s.create_run("r1", "u1", "task")
+    s.finish_run("r1", "failed", 3, 0.02, None,
+                 error="ConnectError: [Errno 11001] getaddrinfo failed")
+    assert s.get_run("r1", "u1").error == \
+        "ConnectError: [Errno 11001] getaddrinfo failed"
+    # no error → stays None (legacy rows and happy paths keep their shape)
+    s.create_run("r2", "u1", "t2")
+    s.finish_run("r2", "done", 1, 0.0, "ok")
+    assert s.get_run("r2", "u1").error is None
+
+
 def test_legacy_lines_read_back_with_none_not_zero(tmp_path):
     """A store written before v2 must fold cleanly; missing fields read as
     None (unknown), never a fabricated zero."""

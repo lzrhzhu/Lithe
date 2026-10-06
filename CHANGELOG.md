@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.3 (2026-10-06)
+
+The diagnosability round, from a real failure: session #54 fanned two review
+tasks to `researcher` in one `delegate_parallel`; the first burned ~670K
+prompt tokens, then a transient upstream/gateway error killed the second
+delegation's very first model call *and* the orchestrator's next call — and
+nothing stored could say why. The follow-up analysis session (and the user)
+hit a dead end because the kernel logged the exception to stderr and emitted
+only a generic `模型请求出错，请稍后重试。`: no detail in the error event,
+no detail in the delegation summary, no detail in the run's stored final
+state. Failures are now diagnosable after the fact, end to end.
+
+- **failed model calls keep their reason** (`lithe.runtime`) — `RunStats`
+  gains an ``error`` field (exception class + message, single line, capped
+  at 300 chars); every failure branch sets it (HTTP status errors, generic
+  exceptions, stream-without-result, empty responses) and the generic
+  branch's error event now carries the detail inline
+  （``模型请求出错（ConnectError: …），请稍后重试。``）instead of hiding it
+  in the log.
+- **delegation summaries explain failures** (`lithe.bundles.subagents`) —
+  `summarize` appends a ``失败原因：…`` line from `RunStats.error`, so the
+  orchestrator's model sees *why* a worker died (a transient gateway error
+  invites one retry; a 404 does not) instead of a bare ``运行失败``.
+- **run_final rows record the error** (`lithe.bundles.store`,
+  `lithe.bundles.host`) — `finish_run` accepts an ``error`` diagnostic,
+  `JsonlRunStore` persists it on the `run_final` line and folds it back
+  into `StoredRun.error`; `AgentHost` forwards `RunStats.error` on every
+  close path (model failure, host-level exception, abandoned) and stamps
+  it on the `done` event, so stored post-mortems no longer depend on the
+  process's stderr.
+
 ## 0.1.2 (2026-10-05)
 
 The parallel-duplicates round plus a maintenance pass: `delegate_parallel`

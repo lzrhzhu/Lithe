@@ -129,6 +129,33 @@ async def test_run_model_error_marks_failed():
                                       stats=stats)]
     assert events[-1]["type"] == "error"
     assert stats.status == "failed" and stats.final_text == ""
+    # the diagnostic (class + message) rides the event and stats, not just
+    # the log — a generic 请稍后重试 leaves a failed run undiagnosable later
+    assert "ConnectError" in events[-1]["message"] and "down" in events[-1]["message"]
+    assert stats.error == "ConnectError: down"
+
+
+async def test_run_model_http_error_keeps_status_and_detail():
+    req = httpx.Request("POST", "https://x/v1/chat/completions")
+    resp = httpx.Response(429, request=req)
+    exc = httpx.HTTPStatusError("HTTP 429", request=req, response=resp)
+
+    class _T:
+        async def complete(self, client, **kw):
+            raise exc
+
+    rt = AgentRuntime(ToolRegistry(),
+                      LLMConfig(model="m", base_url="x", api_key="k",
+                                transport=_T()))
+    ctx = AgentContext(run_id="r", user_id="u")
+    stats = RunStats()
+    events = [e async for e in rt.run(ctx, [{"role": "user", "content": "hi"}], [],
+                                      stats=stats)]
+    err = events[-1]
+    assert err["type"] == "error" and err.get("code") == 429
+    assert "429" in err["message"]
+    assert stats.status == "failed"
+    assert stats.error is not None and "429" in stats.error
 
 
 async def test_run_malformed_tool_call_skipped_not_fatal():

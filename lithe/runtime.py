@@ -56,6 +56,23 @@ log = logging.getLogger("lithe.runtime")
 
 _MAX_STEPS_FALLBACK = "（已达到最大步数。如尚未完成，请补充细节后继续提问。）"
 
+# Cap for the exception detail folded into error events / RunStats.error: a
+# traceback-shaped blob must not flood the display channel or the store row.
+_ERROR_DETAIL_CAP = 300
+
+
+def _exc_detail(exc: BaseException) -> str:
+    """Compact single-line diagnostic for a failed model call:
+    ``"ConnectError: [Errno 11001] getaddrinfo failed"``. This is the string
+    that must reach the user (error event), the run record (RunStats.error →
+    run_final row) and delegation summaries — a generic ``请稍后重试`` with
+    the detail only in a stderr log leaves a failed run undiagnosable after
+    the fact."""
+    text = " ".join(str(exc).split())
+    detail = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    return detail[:_ERROR_DETAIL_CAP] + ("…" if len(detail) > _ERROR_DETAIL_CAP
+                                         else "")
+
 # Run cut short by its cost/token budget (instead of the step cap): the notice
 # becomes the run's final text so the frontend can show why it stopped.
 _BUDGET_FALLBACK = ("（已达到本次运行的成本或 token 预算，运行提前结束。"
@@ -182,10 +199,14 @@ class RunStats:
     context length of the last call (what the model actually saw —
     the number to compare against ``context_window`` for a fullness gauge).
     ``duration_s`` is the wall-clock length of the run, stamped when it
-    ends (the DONE event carries it too).
+    ends (the DONE event carries it too). ``error`` carries the diagnostic
+    of a failed call (exception class + message, capped) so hosts, stores
+    and delegation summaries can show *why* a run failed — not only that
+    it did; ``None`` on every non-failed path.
     """
     final_text: str = ""
     status: str = "done"
+    error: str | None = None
     last_step: int = 0
     duration_s: float = 0.0
     total_cost: float = 0.0
@@ -654,14 +675,22 @@ class AgentRuntime:
                     ctx, {"type": EventType.ERROR, "code": exc.response.status_code,
                           "message": message})
                 stats.status = "failed"
+                stats.error = _exc_detail(exc)
                 state["finished"] = True
                 return
             except Exception as exc:  # noqa: BLE001
                 log.warning("agent model error: %s", exc)
+                # The exception detail rides the event and stats (not just
+                # the log): a transient gateway / network failure is the
+                # single most common hard failure, and hiding its nature
+                # behind a generic message leaves the store unable to say
+                # later why the run — or a delegation inside it — died.
+                detail = _exc_detail(exc)
                 yield await self._emit(
                     ctx, {"type": EventType.ERROR,
-                          "message": "模型请求出错，请稍后重试。"})
+                          "message": f"模型请求出错（{detail}），请稍后重试。"})
                 stats.status = "failed"
+                stats.error = detail
                 state["finished"] = True
                 return
             if result is None:
@@ -669,6 +698,7 @@ class AgentRuntime:
                     ctx, {"type": EventType.ERROR,
                           "message": "模型流式响应未返回结果，请稍后重试。"})
                 stats.status = "failed"
+                stats.error = "stream returned no result"
                 state["finished"] = True
                 return
 
@@ -755,6 +785,7 @@ class AgentRuntime:
                 # status instead of "successfully" reporting empty text.
                 stats.status = "empty_response"
                 stats.final_text = ""
+                stats.error = "model returned an empty response (no text, no tool calls)"
                 state["finished"] = True
                 yield await self._emit(
                     ctx, {"type": EventType.ERROR,
