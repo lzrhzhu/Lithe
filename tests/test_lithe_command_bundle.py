@@ -21,6 +21,10 @@ def _runner(**kwargs) -> CommandRunner:
     return CommandRunner(timeout=kwargs.pop("timeout", 5), **kwargs)
 
 
+def _pwd_command() -> str:
+    return "Get-Location" if sys.platform == "win32" else "pwd"
+
+
 async def test_run_command_auto_shell_in_workspace(tmp_path):
     command = (
         "Write-Output 'hello'; Get-Location"
@@ -253,3 +257,91 @@ def test_decode_output_prefers_utf8_then_locale_fallback():
     # no fallback: undecodable bytes degrade to replacements, never raise
     out = _decode_output(b"\xd5\xe2\xca\xc7", None)
     assert "\ufffd" in out
+
+
+# --- cwd: anchor, containment, approval ---------------------------------------
+
+
+async def test_run_command_cwd_relative_and_absolute(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    for cwd in ("sub", str(sub)):
+        result = await _runner().run(tmp_path, _pwd_command(), cwd=cwd)
+        assert result["exit_code"] == 0
+        assert str(sub) in result["stdout"]
+
+
+async def test_run_command_cwd_defaults_to_workspace_root(tmp_path):
+    result = await _runner().run(tmp_path, _pwd_command(), cwd=None)
+    assert result["exit_code"] == 0
+    assert str(tmp_path) in result["stdout"]
+
+
+async def test_run_command_cwd_missing_dir_fails_fast(tmp_path):
+    result = await _runner().run(tmp_path, _pwd_command(), cwd="no-such-dir")
+    assert result["exit_code"] == -1
+    assert "不存在" in result["stderr"]
+
+
+async def test_run_command_cwd_escape_refused_without_allow(tmp_path):
+    result = await _runner().run(tmp_path, _pwd_command(), cwd="../..")
+    assert result["exit_code"] == -1
+    assert "工作区之外" in result["stderr"]
+
+
+async def test_run_command_cwd_via_registry_dispatch(tmp_path):
+    sub = tmp_path / "proj"
+    sub.mkdir()
+    registry = ToolRegistry()
+    register_command_tools(registry, lambda ctx: tmp_path, _runner())
+    ctx = AgentContext(run_id="r", user_id="u")
+    result = await registry.dispatch(
+        "run_command", {"command": _pwd_command(), "cwd": "proj"}, ctx)
+    assert result.ok and str(sub) in result.content
+    missing = await registry.dispatch(
+        "run_command", {"command": _pwd_command(), "cwd": "missing"}, ctx)
+    assert not missing.ok and "不存在" in missing.content
+
+
+async def test_run_command_external_cwd_approval_flow(tmp_path, tmp_path_factory):
+    """External cwd: refused without an approver, denied when the approver
+    says no, executed in the outside directory when approved."""
+    outside = tmp_path_factory.mktemp("outside")
+    command = (
+        "Write-Output ext; Get-Location" if sys.platform == "win32"
+        else "printf ext; pwd"
+    )
+    ctx = AgentContext(run_id="r", user_id="u")
+
+    registry = ToolRegistry()
+    register_command_tools(registry, lambda ctx: tmp_path, _runner())
+    assert "cwd" in registry.spec("run_command").parameters["properties"]
+    refused = await registry.dispatch(
+        "run_command", {"command": command, "cwd": str(outside)}, ctx)
+    assert not refused.ok
+    assert "工作区" in refused.content
+
+    async def deny(cmd):
+        deny.seen = cmd
+        return False
+
+    denied_reg = ToolRegistry()
+    register_command_tools(
+        denied_reg, lambda ctx: tmp_path, _runner(), approver=deny)
+    denied = await denied_reg.dispatch(
+        "run_command", {"command": command, "cwd": str(outside)}, ctx)
+    assert not denied.ok
+    assert "拒绝" in denied.summary + denied.content
+    assert "cwd=" in deny.seen  # the human sees what they are approving
+
+    async def allow(cmd):
+        return True
+
+    allowed_reg = ToolRegistry()
+    register_command_tools(
+        allowed_reg, lambda ctx: tmp_path, _runner(), approver=allow)
+    allowed = await allowed_reg.dispatch(
+        "run_command", {"command": command, "cwd": str(outside)}, ctx)
+    assert allowed.ok
+    assert "ext" in allowed.content
+    assert str(outside) in allowed.content

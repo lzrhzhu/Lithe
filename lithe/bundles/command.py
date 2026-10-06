@@ -102,6 +102,40 @@ def _windows_bash() -> str | None:
     return None
 
 
+def _workspace_root(root: str | Path) -> Path:
+    """Resolve the workspace anchor (sync helper: pathlib stays out of the
+    async bodies, which ASYNC240 polices)."""
+    return Path(root).resolve()
+
+
+def _resolve_cwd(root: str | Path, raw: str | Path | None,
+                 *, allow_external: bool = False) -> Path:
+    """Resolve a run_command *cwd* against the workspace *root*.
+
+    Relative paths anchor at *root* (never at the process cwd); absolute
+    paths are taken as-is. Containment is checked post-``resolve()`` so
+    ``..`` segments and in-root symlinks pointing outside cannot slip the
+    anchor. Results outside the root raise :class:`PermissionError` — the
+    tool layer routes that through the host's approval channel (direct
+    ``CommandRunner`` callers just get the refusal unless they pass
+    ``allow_external``); a missing/non-directory raises
+    :class:`NotADirectoryError` so the call fails fast with a clear
+    message instead of a subprocess spawn error.
+    """
+    text = "" if raw is None else str(raw).strip()
+    if not text or text in (".", "./"):
+        return _workspace_root(root)
+    candidate = Path(text)
+    anchor = _workspace_root(root)
+    target = candidate if candidate.is_absolute() else anchor / candidate
+    target = target.resolve()
+    if target != anchor and anchor not in target.parents and not allow_external:
+        raise PermissionError(f"cwd escapes workspace: {raw}")
+    if not target.is_dir():
+        raise NotADirectoryError(f"cwd 不存在或不是目录：{raw}")
+    return target
+
+
 def _bash_unavailable_message() -> str:
     has_wsl = _find_shell(("wsl",)) is not None
     msg = ("未找到 Windows 侧的 bash（Git for Windows）。"
@@ -126,7 +160,9 @@ def _host_shell_note() -> str:
     """
     if os.name != "nt":
         auto = "bash" if _find_shell(("bash",)) else "sh"
-        return f"当前宿主是 Linux/macOS（POSIX），auto 使用 {auto}。"
+        return (f"当前宿主是 Linux/macOS（POSIX），auto 使用 {auto}。"
+                "惯用法：依赖前一条成功的命令用 && 连接；"
+                "读取文件内容优先用文件工具，避免 shell 编码差异。")
     has_pwsh = _find_shell(("pwsh",)) is not None
     has_ps = has_pwsh or _find_shell(("powershell",)) is not None
     git_bash = _windows_bash()
@@ -149,6 +185,14 @@ def _host_shell_note() -> str:
         note += ('；本机没有 Windows 侧 bash，shell="bash" 会直接报错——'
                  "POSIX 命令请改写为 PowerShell，或显式 shell=\"wsl\" 在 Linux "
                  "子系统中执行")
+    if has_ps:
+        note += ("。PowerShell 惯用法：依赖前一条成功的命令写 "
+                 "cmd1; if ($?) { cmd2 }（5.1 没有 &&）；"
+                 "调用当前目录下的程序必须带 .\\ 前缀（如 .\\tool.exe），"
+                 "路径带空格时用调用操作符 & \"...\"；"
+                 "读取文件内容优先用文件工具（编码可靠），"
+                 "确需 Get-Content 时加 -Encoding UTF8，避免中文乱码；"
+                 "特殊字符用反引号转义，子表达式用 $(...)")
     return note + "。"
 
 
@@ -360,7 +404,9 @@ class CommandRunner:
         return min(max(value, 1.0), _MAX_CALL_TIMEOUT)
 
     async def run(self, root: str | Path, command: str, shell: str = "auto",
-                  stdin: str | None = None, timeout: float | None = None) -> dict:
+                  stdin: str | None = None, timeout: float | None = None,
+                  cwd: str | Path | None = None, *,
+                  allow_external_cwd: bool = False) -> dict:
         call_timeout = self._call_timeout(timeout)
         if not command.strip():
             return {"stdout": "", "stderr": "命令不能为空。", "exit_code": -1,
@@ -370,7 +416,20 @@ class CommandRunner:
         except (FileNotFoundError, ValueError) as exc:
             return {"stdout": "", "stderr": str(exc), "exit_code": -1,
                     "duration": 0.0, "timed_out": False}
-        cwd = os.fspath(root)
+        root_path = _workspace_root(root)
+        try:
+            cwd_path = _resolve_cwd(root_path, cwd,
+                                    allow_external=allow_external_cwd)
+        except NotADirectoryError as exc:
+            return {"stdout": "", "stderr": str(exc), "exit_code": -1,
+                    "duration": 0.0, "timed_out": False}
+        except PermissionError:
+            return {"stdout": "",
+                    "stderr": (f"cwd 指向工作区之外：{cwd}。工作区外的执行"
+                               "位置需要用户审批；交互式前端的审批通道"
+                               "通过后才会到达这里。"),
+                    "exit_code": -1, "duration": 0.0, "timed_out": False}
+        cwd = os.fspath(cwd_path)
         kwargs = {}
         if os.name == "nt":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -629,7 +688,17 @@ def register_command_tools(
     registry: ToolRegistry,
     workspace_for: Callable[[AgentContext], str | Path],
     runner: CommandRunner | None = None,
+    approver: Callable[[str], Awaitable[bool]] | None = None,
 ) -> None:
+    """Register ``run_command``.
+
+    ``approver`` is the host's human-confirmation channel (the same one
+    ``make_command_guard`` uses for destructive commands); here it gates
+    only the one escalation ``cwd`` represents: a working directory
+    outside the workspace. Without an approver, external cwd is refused
+    with guidance — an unattended agent must not relocate execution
+    silently.
+    """
     command_runner = runner or CommandRunner()
 
     async def run_command(ctx: AgentContext, args: dict) -> ToolResult:
@@ -637,9 +706,47 @@ def register_command_tools(
         if not command.strip():
             return ToolResult(False, "缺少 command", "run_command 需要非空 command。")
         shell = args.get("shell") or "auto"
+        root_path = _workspace_root(workspace_for(ctx))
+        external_approved = False
+        try:
+            cwd_path = _resolve_cwd(root_path, args.get("cwd"))
+        except NotADirectoryError as exc:
+            return ToolResult(
+                False, "cwd 无效",
+                f"run_command 的 {exc}。cwd 必须是已存在的目录："
+                f"相对工作区根的路径，或工作区内的绝对路径。")
+        except PermissionError:
+            preview = command if len(command) <= 100 else command[:97] + "..."
+            if approver is None:
+                return ToolResult(
+                    False, "需用户审批",
+                    f"cwd 指向工作区之外，需要用户确认后才允许在那里执行：\n"
+                    f"cwd={args.get('cwd')}\n命令：{preview}\n"
+                    f"请改用工作区内的目录（相对工作区根），"
+                    f"或在交互式界面（TUI）中运行以获得审批确认。")
+            try:
+                allowed = await approver(f"{command}（cwd={args.get('cwd')}）")
+            except Exception:  # noqa: BLE001 — a broken approver denies
+                return ToolResult(False, "审批失败",
+                                  "审批通道异常，为安全起见命令未执行。")
+            if not allowed:
+                return ToolResult(
+                    False, "用户已拒绝",
+                    f"用户拒绝在工作区之外执行（cwd={args.get('cwd')}）：\n{preview}\n"
+                    f"请改用工作区内目录，不要原样重试。")
+            cwd_path = _resolve_cwd(root_path, args.get("cwd"),
+                                    allow_external=True)
+            external_approved = True
+        # cwd kwargs only when they carry information: custom runners with
+        # the pre-cwd signature keep working for the default (root) case.
+        run_kwargs: dict = {}
+        if cwd_path != root_path:
+            run_kwargs["cwd"] = cwd_path
+            if external_approved:
+                run_kwargs["allow_external_cwd"] = True
         result = await command_runner.run(
             workspace_for(ctx), command, shell, args.get("stdin"),
-            timeout=args.get("timeout"))
+            timeout=args.get("timeout"), **run_kwargs)
         parts = []
         if result["stdout"].strip():
             parts.append(result["stdout"].rstrip())
@@ -657,14 +764,17 @@ def register_command_tools(
         )
 
     description = (
-        "在主机上执行工作区目录下的系统 shell 命令。auto 在 Linux/macOS 使用 bash（缺少时用 sh），"
+        "在主机上执行系统 shell 命令，默认在工作区根目录执行；"
+        "需要在内层目录运行时（子项目、嵌套仓库、CI/构建脚本的相对路径）"
+        "用 cwd 参数指定工作目录，不要在命令里拼接 cd。"
+        "auto 在 Linux/macOS 使用 bash（缺少时用 sh），"
         "在 Windows 使用 PowerShell（缺少时用 cmd）；也可指定 bash（仅 Windows 侧的 Git-Bash / POSIX 主机）、"
         "sh、powershell、cmd，或 wsl（仅在 Windows 宿主可用：命令在 Linux 子系统中执行，"
         "路径与解释器和 Windows 侧不同）。命令拥有当前用户的主机权限，可访问工作区以外的文件和网络，"
         "副作用不可撤销；仅在用户明确启用此能力后调用。"
         "危险命令有防线：毁灭性操作（如 rm -rf /、mkfs、format 盘符）会被直接拒绝；"
         "破坏性但可控的操作（如 rm -r 指定目录、git push --force、sudo）需要用户审批，"
-        "被拒后不要原样重试。\n"
+        "被拒后不要原样重试；工作区之外的 cwd 同样需要用户审批。\n"
         + _host_shell_note()
     )
 
@@ -676,6 +786,16 @@ def register_command_tools(
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "要执行的系统命令"},
+                    "cwd": {
+                        "type": "string",
+                        "description": (
+                            "可选工作目录：相对工作区根的路径，或工作区内的"
+                            "绝对路径，必须是已存在的目录。项目里的命令"
+                            "（pytest、构建脚本、CI 步骤）假设自己在项目根"
+                            "执行，对子项目/嵌套仓库运行时用它指定目录。"
+                            "省略时在工作区根执行；工作区之外的 cwd 需要"
+                            "用户审批"),
+                    },
                     "shell": {
                         "type": "string",
                         "enum": ["auto", "bash", "sh", "powershell", "cmd", "wsl"],
