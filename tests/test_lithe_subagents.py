@@ -658,14 +658,22 @@ async def test_subagent_progress_callback_gets_live_events(tmp_path):
     store.create_run("r1", "u1", "t")
     await engine.run("writer", "write p", ctx)
 
-    kinds = [(p["agent"], p["event"]["type"]) for p in progress]
+    lifecycle = [p for p in progress if p.get("type") == "subagent_start"]
+    assert len(lifecycle) == 1
+    assert lifecycle[0]["agent"] == "writer"
+    assert lifecycle[0]["instance"].startswith("writer:")
+    kinds = [(p["agent"], p["event"]["type"]) for p in progress
+             if p.get("type") == "subagent_progress"]
     assert all(a == "writer" for a, _ in kinds)
+    assert all(p["instance"] == lifecycle[0]["instance"]
+               for p in progress if p.get("type") == "subagent_progress")
     assert "step" in [k for _, k in kinds]
     assert "tool_call" in [k for _, k in kinds]
     assert "tool_result" in [k for _, k in kinds]
     # 文本类事件有但被截断保护
     texts = [p["event"]["text"] for p in progress
-             if p["event"]["type"] == "assistant"]
+             if p.get("type") == "subagent_progress"
+             and p["event"]["type"] == "assistant"]
     assert texts == ["finished writing"]
 
 

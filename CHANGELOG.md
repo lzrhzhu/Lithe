@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5 (2026-10-06)
+
+- Persist subagent lifecycle records with task metadata, display name, terminal status, step count, and change count for history consumers.
+
+
 ## 0.1.4 (2026-10-06)
 
 The parallelism round: session #56 fanned three read-only review tasks to one

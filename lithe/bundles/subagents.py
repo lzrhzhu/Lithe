@@ -262,7 +262,21 @@ class SubagentEngine:
                     {"role": "user", "content": user_msg}]
         self.host.store.add_message(StoredMessage(
             role="user", content=user_msg, run_id=sub_ctx.run_id,
-            user_id=sub_ctx.user_id, subagent=tag))
+            user_id=sub_ctx.user_id,
+            meta={"subagent_task": {"agent": sub_id,
+                                    "display": spec.display,
+                                    "task": task,
+                                    "instance": tag,
+                                    "status": "running"}},
+            subagent=tag))
+        if self.on_subagent_event is not None:
+            try:
+                await self.on_subagent_event(
+                    sub_ctx, {"type": "subagent_start", "agent": sub_id,
+                             "instance": tag, "task": task,
+                             "display": spec.display})
+            except Exception as exc:  # noqa: BLE001
+                log.warning("subagent start callback failed: %s", exc)
 
         stats = RunStats()
         steps = spec.max_steps or self.max_steps or self.host.max_steps
@@ -335,7 +349,9 @@ class SubagentEngine:
                                 await self.on_subagent_event(
                                     sub_ctx, {"type": "subagent_progress",
                                               "agent": sub_id,
-                                              "instance": tag, "event": thin})
+                                              "instance": tag,
+                                              "display": spec.display,
+                                              "event": thin})
                             except Exception as exc:  # noqa: BLE001
                                 log.warning("subagent progress callback failed: %s",
                                             exc)
@@ -414,6 +430,21 @@ class SubagentEngine:
                                             grounding=grounding,
                                             instance=instance)
         summary = self.summarize(spec, stats, sub_actions)
+        # Persist a compact terminal marker alongside the already-recorded
+        # instance-tagged transcript. The parent transcript excludes subagent
+        # rows by default, while history UIs can opt in and rebuild status.
+        self.host.store.add_message(StoredMessage(
+            role="assistant", content=None, run_id=parent_ctx.run_id,
+            user_id=parent_ctx.user_id,
+            meta={"subagent_task": {"agent": sub_id,
+                                    "display": spec.display,
+                                    "task": task,
+                                    "instance": instance,
+                                    "status": stats.status,
+                                    "steps": stats.last_step,
+                                    "changes": sum(1 for a in sub_actions
+                                                   if a.status != "skipped")}},
+            subagent=instance))
         # ok only when the subagent actually ran to completion (naturally or
         # via its step-cap summary); cancelled / budget-cut delegations did
         # not finish their task and must not read as success to the model.
