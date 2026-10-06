@@ -8,9 +8,14 @@ orchestrator's replayed history: that is the whole point (the orchestrator's
 context stays lean across turns).
 
 A subagent's internal messages/actions are still recorded under the *parent*
-``run_id`` but tagged with its id (``subagent``), so a later undo reverts every
-mutation while the orchestrator's model-context replay drops them. Delegation is
-exactly one level deep: no subagent gets the ``delegate`` tool.
+``run_id`` but tagged with a per-delegation *instance* id
+(``subagent = "<agent>:<hex8>"``), so a later undo reverts every mutation
+while the orchestrator's model-context replay drops them. Instance tagging
+is what makes same-agent parallel delegation safe: attribution, messages
+and live-usage accounting key on the delegation instance, never on the
+roster id, so two concurrent delegations of one subagent cannot
+cross-claim each other's work. Delegation is exactly one level deep: no
+subagent gets the ``delegate`` tool.
 
 The *mechanism* is generic and lives here; the *roster* (subagent ids, personas,
 tool lists, skill stems) is host data passed to :class:`SubagentRoster`.
@@ -208,20 +213,31 @@ class SubagentEngine:
 
     # -- execution ------------------------------------------------------------
     async def run(self, sub_id: str, task: str, parent_ctx: AgentContext, *,
-                  grounding: str = "") -> tuple[RunStats, list]:
-        """Run one subagent to completion under the parent run, tagged ``sub_id``.
+                  grounding: str = "",
+                  instance: str | None = None) -> tuple[RunStats, list]:
+        """Run one subagent to completion under the parent run, tagged with
+        a unique per-delegation instance id.
+
+        The context / store tag is ``"<agent>:<hex8>"`` (or the caller's
+        explicit ``instance``), NOT the bare roster id: messages, actions
+        and the live-usage slot all key on the delegation instance, so two
+        concurrent delegations of the same subagent — which the parallel
+        tool now starts freely — cannot cross-claim each other's mutations
+        in summaries or undo labels. Passing a previously used
+        ``instance`` tag gives resume-like accounting: the high-water
+        snapshot below then excludes that instance's earlier actions
+        instead of starting empty.
 
         Returns ``(stats, sub_actions)`` where ``sub_actions`` are *this
-        delegation's own* mutations (new since a high-water snapshot of the
-        subagent's prior actions), so chained / repeated delegations of the same
-        subagent never recount earlier work.
+        instance's own* mutations (new since its snapshot).
         """
         spec = self.roster.get(sub_id)
         if spec is None:
             raise KeyError(f"unknown subagent: {sub_id}")
+        tag = instance or f"{sub_id}:{uuid.uuid4().hex[:8]}"
         sub_ctx = AgentContext(run_id=parent_ctx.run_id, user_id=parent_ctx.user_id,
                                disabled_tools=parent_ctx.disabled_tools,
-                               subagent=sub_id, extra=dict(parent_ctx.extra),
+                               subagent=tag, extra=dict(parent_ctx.extra),
                                # shared BY REFERENCE: the run's cross-context
                                # state (stale-file guard revisions, …) must be
                                # one map for the orchestrator and every
@@ -229,14 +245,16 @@ class SubagentEngine:
                                # subagents can clobber the same file unseen.
                                shared=parent_ctx.shared)
 
-        # High-water snapshot of this subagent's existing actions, as a SET of
-        # ids: ``Action.id`` is opaque/host-assigned (ints, strings, ...), so
-        # comparing it numerically — or at all — would assume store internals.
-        # Membership in the pre-delegation set is the only contract needed.
-        # The subagent-filtered query keeps a long run's snapshots O(this
-        # subagent) instead of rehydrating every earlier delegation's blobs.
+        # High-water snapshot of this instance's existing actions, as a SET
+        # of ids: ``Action.id`` is opaque/host-assigned (ints, strings, ...),
+        # so comparing it numerically — or at all — would assume store
+        # internals. Membership in the pre-delegation set is the only
+        # contract needed. Fresh instances start empty; a reused instance
+        # tag (resume) excludes its earlier work. The instance-filtered
+        # query keeps a long run's snapshots O(this delegation) instead of
+        # rehydrating every earlier delegation's blobs.
         prev_ids = {a.id for a in self.host.store.list_actions(
-            sub_ctx.run_id, sub_ctx.user_id, subagent=sub_id)
+            sub_ctx.run_id, sub_ctx.user_id, subagent=tag)
             if a.id is not None}
 
         user_msg = task + (f"\n\n【编排者补充上下文】\n{grounding}" if grounding else "")
@@ -244,7 +262,7 @@ class SubagentEngine:
                     {"role": "user", "content": user_msg}]
         self.host.store.add_message(StoredMessage(
             role="user", content=user_msg, run_id=sub_ctx.run_id,
-            user_id=sub_ctx.user_id, subagent=sub_id))
+            user_id=sub_ctx.user_id, subagent=tag))
 
         stats = RunStats()
         steps = spec.max_steps or self.max_steps or self.host.max_steps
@@ -285,9 +303,9 @@ class SubagentEngine:
         # counts the OTHER slots against its own cap (see
         # AgentRuntime._over_budget), so N parallel workers share one
         # ceiling instead of each burning the full max_cost. The slot is
-        # keyed per delegation (not per subagent id) and popped at the end —
-        # sequential delegations keep their independent caps.
-        slot = f"{sub_id}:{uuid.uuid4().hex[:8]}"
+        # the delegation instance (unique per run, reused for nothing else)
+        # and popped at the end.
+        slot = tag
         sub_ctx.extra["_delegation_slot"] = slot
         inflight = parent_ctx.shared.setdefault("_inflight_sub_usage", {})
         inflight[slot] = {"cost": 0.0, "tokens": 0}
@@ -316,7 +334,8 @@ class SubagentEngine:
                             try:
                                 await self.on_subagent_event(
                                     sub_ctx, {"type": "subagent_progress",
-                                              "agent": sub_id, "event": thin})
+                                              "agent": sub_id,
+                                              "instance": tag, "event": thin})
                             except Exception as exc:  # noqa: BLE001
                                 log.warning("subagent progress callback failed: %s",
                                             exc)
@@ -341,7 +360,7 @@ class SubagentEngine:
         acc["total_tokens"] += stats.total_tokens
 
         sub_actions = [a for a in self.host.store.list_actions(
-            sub_ctx.run_id, sub_ctx.user_id, subagent=sub_id)
+            sub_ctx.run_id, sub_ctx.user_id, subagent=tag)
             if a.id is not None and a.id not in prev_ids]
         return stats, sub_actions
 
@@ -390,7 +409,10 @@ class SubagentEngine:
         if not task:
             return ToolResult(False, "委派失败", "请给出子代理要执行的 task。")
 
-        stats, sub_actions = await self.run(sub_id, task, parent_ctx, grounding=grounding)
+        instance = f"{sub_id}:{uuid.uuid4().hex[:8]}"
+        stats, sub_actions = await self.run(sub_id, task, parent_ctx,
+                                            grounding=grounding,
+                                            instance=instance)
         summary = self.summarize(spec, stats, sub_actions)
         # ok only when the subagent actually ran to completion (naturally or
         # via its step-cap summary); cancelled / budget-cut delegations did
@@ -399,10 +421,10 @@ class SubagentEngine:
         changes = sum(1 for a in sub_actions if a.status != "skipped")
         ui = [
             {"type": "subagent_start", "agent": sub_id, "display": spec.display,
-             "task": task},
+             "task": task, "instance": instance},
             {"type": "subagent_end", "agent": sub_id, "display": spec.display,
              "status": stats.status, "steps": stats.last_step,
-             "changes": changes, "ok": ok},
+             "changes": changes, "ok": ok, "instance": instance},
         ]
         return ToolResult(ok, summary[:200], summary, ui=ui)
 
@@ -489,12 +511,16 @@ def make_parallel_delegate_tool(engine: SubagentEngine,
                                 ) -> tuple[ToolSpec, Any]:
     """Build the ``delegate_parallel`` tool: fan several subagents out at once.
 
-    Distinct agents' tasks run ``engine.delegate`` concurrently (bounded by
-    the engine's ``max_parallel``, if set); several tasks on the SAME agent
-    run sequentially in listed order (one live delegation per agent — see
-    the chaining note in the handler). One failing subagent does not abort
-    the others — the result reports per-agent blocks and ``ok`` is True only
-    when all succeeded. Categories/META, like ``delegate``.
+    Every task runs ``engine.delegate`` concurrently, bounded by the
+    engine's ``max_parallel`` (None = unbounded) — including several tasks
+    on the SAME agent. Same-agent parallelism is safe because each
+    delegation is its own instance: messages, action attribution and the
+    live-usage slot key on the unique instance tag
+    (``SubagentEngine.run``), never on the roster id, so two concurrent
+    delegations of one subagent cannot cross-claim each other's work any
+    more than two different agents can. One failing subagent does not
+    abort the others — the result reports per-agent blocks and ``ok`` is
+    True only when all succeeded. Categories/META, like ``delegate``.
 
     ``timeout`` caps EACH task's wall-clock time individually (per task, not
     per batch, and counted only while running — a task queued behind the
@@ -552,38 +578,16 @@ def make_parallel_delegate_tool(engine: SubagentEngine,
                     f"子代理 {item['agent']} 执行超时（{timeout:g}s 内未完成），"
                     f"已被中止；其余子代理不受影响。")
 
-        # Same-agent tasks run sequentially (in listed order), distinct
-        # agents concurrently. SubagentEngine.run attributes a delegation's
-        # mutations as "actions new since this subagent's pre-run snapshot";
-        # two same-named instances in flight would each claim the other's
-        # work in summaries and undo labels. Chaining preserves the
-        # one-live-task-per-agent invariant without rejecting the batch —
-        # and, like the semaphore queue above, waiting for a predecessor
-        # does not burn the per-task timeout (it counts only while running).
-        prev_by_agent: dict[str, asyncio.Task] = {}
-
-        async def run_after(prev: asyncio.Task | None, item: dict) -> ToolResult:
-            if prev is not None:
-                try:
-                    await prev
-                except asyncio.CancelledError:
-                    raise  # parent cancellation must keep flowing
-                except BaseException:  # noqa: BLE001 — a crashed predecessor
-                    pass               # must not doom the queued sibling
-            return await run_one(item)
-
-        futures: list[asyncio.Task] = []
-        for it in items:
-            fut = asyncio.ensure_future(
-                run_after(prev_by_agent.get(it["agent"]), it))
-            prev_by_agent[it["agent"]] = fut
-            futures.append(fut)
-
+        # Same-agent tasks run alongside distinct-agent tasks: delegation is
+        # instance-scoped (unique tag per run), so attribution, summaries
+        # and undo labels cannot cross-claim between concurrent siblings.
         # return_exceptions=True: a *crashed* delegate (store failure, bug —
         # anything escaping as an exception rather than a failed ToolResult)
         # must not abort its siblings mid-flight, which would also leave them
         # running as unawaited orphans. Crashes are reported per agent below.
-        outcomes = await asyncio.gather(*futures, return_exceptions=True)
+        outcomes = await asyncio.gather(
+            *[asyncio.ensure_future(run_one(it)) for it in items],
+            return_exceptions=True)
         blocks = []
         succeeded = 0
         ui: list[dict] = []
@@ -606,9 +610,9 @@ def make_parallel_delegate_tool(engine: SubagentEngine,
 
     spec = ToolSpec(
         name,
-        "把多项独立工作并行委派给多个子代理（各在隔离上下文里完成）。不同"
-        "子代理的任务并行执行；同一子代理的多项任务按列出顺序串行执行，"
-        "无需合并或拆分调用。任务之间必须互不依赖；返回每个子代理的完成"
+        "把多项独立工作并行委派给子代理（各在隔离上下文里完成）。所有任务"
+        "同时执行——包括给同一个子代理的多项任务（每次委派都是独立实例，"
+        "互不共享上下文）。任务之间必须互不依赖；返回每个子代理的完成"
         "摘要。适合扇出检索/多方案生成。",
         {"type": "object",
          "properties": {

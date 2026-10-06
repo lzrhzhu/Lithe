@@ -140,7 +140,7 @@ async def test_capture_actions_false_leaves_domain_logging_to_the_host(tmp_path)
     await SubagentEngine(host, roster, capture_actions=False).run(
         "writer", "write", AgentContext(run_id="r2", user_id="u1"))
     rows = store.list_actions("r2", "u1")
-    assert len(rows) == 1 and rows[0].subagent == "writer"
+    assert len(rows) == 1 and rows[0].subagent.startswith("writer:")
     # messages are still recorded (tagged) — capture off affects actions only
     assert store.messages_for_run("r2", "u1")
 
@@ -158,16 +158,18 @@ async def test_engine_run_tags_and_summarizes(tmp_path):
 
     stats, sub_actions = await engine.run("writer", "write b.txt", ctx)
     assert stats.status == "done" and stats.final_text == "wrote b.txt"
-    assert len(sub_actions) == 1 and sub_actions[0].subagent == "writer"
+    assert len(sub_actions) == 1 and sub_actions[0].subagent.startswith("writer:")
 
     s = engine.summarize(roster.get("writer"), stats, sub_actions)
     assert "写者" in s and "写入 b.txt" in s
 
-    # subagent messages recorded under the parent run, tagged
+    # subagent messages recorded under the parent run, tagged with the
+    # delegation instance ("<agent>:<hex8>")
     all_msgs = store.messages_for_runs(["r1"], "u1", exclude_subagent=False)
     orch_msgs = store.messages_for_runs(["r1"], "u1", exclude_subagent=True)
     assert len(all_msgs) > len(orch_msgs)
-    assert all(m["subagent"] == "writer" for m in all_msgs if m["subagent"])
+    assert all(m["subagent"].startswith("writer:")
+               for m in all_msgs if m["subagent"])
 
 
 async def test_engine_high_water_not_recounted(tmp_path):
@@ -307,9 +309,11 @@ async def test_delegate_tool_end_to_end(tmp_path):
                                         "please delegate writing b.txt")]
     assert events[-1]["type"] == EventType.DONE and events[-1]["status"] == "done"
 
-    # the subagent's mutation is recorded under the parent run, tagged
+    # the subagent's mutation is recorded under the parent run, tagged with
+    # its delegation instance ("<agent>:<hex8>" — never the bare roster id)
     acts = store.list_actions("r1", "u1")
-    assert any(a.kind == "file_write" and a.subagent == "writer" for a in acts)
+    assert any(a.kind == "file_write" and a.subagent.startswith("writer:")
+               for a in acts)
 
     # the delegate tool result carries subagent_start/subagent_end + summary
     all_msgs = store.messages_for_runs(["r1"], "u1", exclude_subagent=False)
@@ -480,10 +484,11 @@ async def test_delegate_parallel_crash_isolated(tmp_path):
 
     real_run = engine.run
 
-    async def booming_run(sub_id, task, parent_ctx, grounding=""):
+    async def booming_run(sub_id, task, parent_ctx, grounding="", **kw):
         if sub_id == "bad":
             raise RuntimeError("store exploded")
-        return await real_run(sub_id, task, parent_ctx, grounding=grounding)
+        return await real_run(sub_id, task, parent_ctx, grounding=grounding,
+                              **kw)
 
     engine.run = booming_run
 
@@ -513,36 +518,47 @@ async def test_delegate_parallel_validates_batch_and_agents(tmp_path):
     assert empty.ok is False
 
 
-async def test_delegate_parallel_same_agent_tasks_run_sequentially(tmp_path):
-    """同一子代理出现在 tasks 多项：批次必须整体成功，且该代理的任务
-    按列出顺序串行执行（互相交错会因快照差集记账而错认动作归属——
-    旧行为是整批拒绝，模型被迫多轮重试）。"""
+async def test_delegate_parallel_same_agent_tasks_run_concurrently(tmp_path):
+    """同一子代理出现在 tasks 多项：批次整体成功，且这些任务真正并发执行
+    （模型把多项只读审查都派给同一个 agent 是自然行为——串行会让
+    “并行委派”名存实亡）。并发安全性来自按委派实例记账：每个任务拿到
+    唯一实例标签（"<agent>:<hex8>"），消息、动作归属与预算槽都键在实例上，
+    互不认领。"""
     import asyncio
 
-    log: list[tuple[str, int]] = []
+    state = {"inflight": 0, "max_inflight": 0, "probe_log": []}
 
     async def probe(ctx, args):
-        log.append(("enter", args["n"]))
-        await asyncio.sleep(0.05)  # 足够让并发的同类任务交错
-        log.append(("exit", args["n"]))
-        return ToolResult(True, "probe", f"probe {args['n']}")
+        # ctx.subagent 是本次委派的实例标签：并发同名任务各自独立
+        state["inflight"] += 1
+        state["max_inflight"] = max(state["max_inflight"],
+                                    state["inflight"])
+        await asyncio.sleep(0.08)  # 足以让并发同类任务的模型调用重叠
+        state["inflight"] -= 1
+        state["probe_log"].append(ctx.subagent)
+        return ToolResult(True, "probe", "probe done")
 
     store = JsonlRunStore(tmp_path)
     reg = ToolRegistry()
     reg.register(ToolSpec("probe", "p", category=ToolCategory.READ), probe)
 
-    # 一个 transport 顺序服务同一代理的两次运行（每次 2 个响应）
-    responses = []
-    for n in (1, 2):
-        responses.append({"choices": [{"message": {
-            "content": "",
-            "tool_calls": [_tc("probe", {"n": n}, cid=f"c{n}")]}}]})
-        responses.append({"choices": [{"message": {"content": f"done {n}"}}]})
+    class _ProbeOnce:
+        """每次委派恰好一次模型调用（max_steps=1）：返回一个 probe 调用。
+        共享一个实例也无需按调用方区分——响应形状对每个委派相同。"""
+
+        async def complete(self, client, **kw):
+            state["inflight"] += 1
+            state["max_inflight"] = max(state["max_inflight"],
+                                        state["inflight"])
+            await asyncio.sleep(0.08)
+            state["inflight"] -= 1
+            return {"content": "", "tool_calls": [_tc("probe", {})],
+                    "usage": {}}
 
     host = AgentHost(reg, LLMConfig(model="m", base_url="x", api_key="k",
-                                    transport=_chat_transport(responses)), store)
+                                    transport=_ProbeOnce()), store)
     roster = SubagentRoster([
-        SubagentSpec("sa", "A", "does a", ["probe"], "p"),
+        SubagentSpec("sa", "A", "does a", ["probe"], "p", max_steps=1),
     ])
     engine = SubagentEngine(host, roster)
     ctx = AgentContext(run_id="r1", user_id="u1")
@@ -552,11 +568,77 @@ async def test_delegate_parallel_same_agent_tasks_run_sequentially(tmp_path):
     _, handler = make_parallel_delegate_tool(engine)
     res = await asyncio.wait_for(handler(ctx, {"tasks": [
         {"agent": "sa", "task": "one"}, {"agent": "sa", "task": "two"}]}), 5.0)
-    assert res.ok, "同名两任务串行执行，批次整体成功"
+    assert res.ok, "同名两任务并发执行，批次整体成功"
     assert "2 成功" in res.summary
     assert res.content.count("### sa（成功）") == 2
-    # 完全串行：第 2 项的 enter 必须晚于第 1 项的 exit
-    assert log == [("enter", 1), ("exit", 1), ("enter", 2), ("exit", 2)]
+    # 真并发：两个委派的模型调用在时间上重叠（串行实现只会得到 1）
+    assert state["max_inflight"] == 2, (
+        f"同名任务的模型调用应重叠运行，max_inflight={state['max_inflight']}")
+    # 实例标签两两不同，且都是 sa 的实例
+    tags = state["probe_log"]
+    assert len(tags) == 2 and len(set(tags)) == 2
+    assert all(t.startswith("sa:") for t in tags)
+    # ui 事件携带 instance，前端能区分同名并行实例
+    instances = [e["instance"] for e in
+                 (res.ui) if e.get("type") == "subagent_start"]
+    assert len(set(instances)) == 2 and all(i.startswith("sa:") for i in instances)
+
+
+async def test_parallel_same_agent_delegations_never_cross_claim(tmp_path):
+    """并发的同名委派各记各的动作：每个实例的 sub_actions 只含自己那次
+    写入（身份键实现里这是强制串行的理由——实例化后约束自然成立）。"""
+    import asyncio
+
+    store = JsonlRunStore(tmp_path)
+    reg = ToolRegistry()
+
+    def make_writer():
+        async def write(ctx, args):
+            return ToolResult(
+                True, f"wrote {args['path']}", f"wrote {args['path']}",
+                ui=[{"type": "file_change", "action": "write",
+                     "path": args["path"], "old": None,
+                     "new": f"content of {args['path']}"}])
+        return write
+
+    reg.register(ToolSpec("write_left", "wl", category=ToolCategory.WRITE),
+                 make_writer())
+    reg.register(ToolSpec("write_right", "wr", category=ToolCategory.WRITE),
+                 make_writer())
+
+    class _T:
+        """奇数号调用写 left、偶数号写 right；哪个委派先到无所谓——
+        断言只看归属，不看顺序。"""
+
+        def __init__(self):
+            self.lock = asyncio.Lock()
+            self.calls = 0
+
+        async def complete(self, client, **kw):
+            async with self.lock:
+                self.calls += 1
+                n = self.calls
+            await asyncio.sleep(0.05)  # 让两个委派的调用交错
+            tool = "write_left" if n % 2 == 1 else "write_right"
+            return {"content": "", "tool_calls": [_tc(tool, {"path": tool[6:]}),
+                                             ], "usage": {}}
+
+    host = AgentHost(reg, LLMConfig(model="m", base_url="x", api_key="k",
+                                    transport=_T()), store)
+    engine = SubagentEngine(host, SubagentRoster([
+        SubagentSpec("w", "W", "d", ["write_left", "write_right"], "p",
+                     max_steps=1)]))
+    ctx = AgentContext(run_id="r1", user_id="u1")
+    store.create_run("r1", "u1", "t")
+
+    (s1, a1), (s2, a2) = await asyncio.gather(
+        engine.run("w", "left job", ctx),
+        engine.run("w", "right job", ctx))
+    # 两个独立实例，各恰好认领自己那一次写入
+    assert len(a1) == 1 and len(a2) == 1
+    assert a1[0].subagent != a2[0].subagent
+    assert a1[0].subagent.startswith("w:") and a2[0].subagent.startswith("w:")
+    assert {a1[0].target, a2[0].target} == {"left", "right"}
 
 
 async def test_subagent_progress_callback_gets_live_events(tmp_path):

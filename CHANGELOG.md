@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.4 (2026-10-06)
+
+The parallelism round: session #56 fanned three read-only review tasks to one
+`researcher` in a single `delegate_parallel` — and they ran strictly one after
+another, because same-agent tasks were serialized (0.1.2's guard against
+snapshot-diff attribution cross-claiming). The guard's premise is now gone:
+delegations are keyed per *instance*, not per agent identity, matching how
+Claude Code / Kilo Code's Task tool works (each call is its own child session;
+the agent type is just a persona). Same-agent tasks now run concurrently like
+everyone else's.
+
+- **delegations are instance-scoped** (`lithe.bundles.subagents`) — every
+  delegation gets a unique tag ``"<agent>:<hex8>"`` used as the context /
+  store ``subagent`` tag, the action-attribution high-water query and the
+  live-usage slot. Two concurrent delegations of one subagent can no longer
+  cross-claim each other's mutations in summaries or undo labels — the reason
+  same-agent serialization existed. ``SubagentEngine.run`` accepts an optional
+  ``instance=`` (reuse a tag for resume-like accounting); progress envelopes
+  and ``subagent_start`` / ``subagent_end`` UI events carry the ``instance``.
+- **`delegate_parallel` runs same-agent tasks concurrently** — the
+  same-agent chaining (``run_after``) is removed; every task starts at once,
+  bounded only by ``max_parallel``. The tool description now tells the model
+  that all tasks, including several on one agent, execute simultaneously.
+
 ## 0.1.3 (2026-10-06)
 
 The diagnosability round, from a real failure: session #54 fanned two review
