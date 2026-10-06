@@ -219,7 +219,10 @@ def test_run_command_description_carries_host_shell_note(tmp_path):
     register_command_tools(registry, lambda ctx: tmp_path, _runner())
     spec = registry.spec("run_command")
     assert "当前宿主" in spec.description
-    assert ("Windows" in spec.description) == (os.name == "nt")
+    # the generic description documents Windows semantics on every host;
+    # only the appended host note must name the actual platform
+    note = spec.description[spec.description.index("当前宿主"):]
+    assert ("Windows" in note) == (os.name == "nt")
     shell_enum = spec.parameters["properties"]["shell"]["enum"]
     assert "wsl" in shell_enum
     assert "timeout" in spec.parameters["properties"]
