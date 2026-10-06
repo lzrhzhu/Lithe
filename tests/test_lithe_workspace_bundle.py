@@ -451,7 +451,14 @@ async def test_read_file_numbers_every_line(tmp_path):
     assert page.ok and page.content.splitlines()[0] == "2: beta"
 
 
-# --- edit_file: identical guard + fuzzy whole-line fallback -------------------
+# --- edit_file: identical guard + strict exact matching -----------------------
+#
+# Kilo-style semantics: edit_file matches old_text EXACTLY — character for
+# character, whitespace and indentation included. A miss is a hard error
+# that teaches the exactness discipline and shows the nearest real block
+# (read-only diagnostics); it never fuzzy-guesses a replacement location.
+# The tolerant whole-line ladder still lives in apply_patch, which anchors
+# edits with @@ context lines instead of a bare old/new pair.
 
 
 async def test_file_tool_summaries_carry_line_delta(tmp_path):
@@ -483,7 +490,10 @@ async def test_edit_identical_old_new_rejected(tmp_path):
     assert r.ok is False and "相同" in r.content
 
 
-async def test_edit_fuzzy_trailing_whitespace(tmp_path):
+async def test_edit_strict_trailing_whitespace_rejected(tmp_path):
+    """Whitespace divergence is a hard miss: the fuzzy ladder that silently
+    tolerated it could anchor the wrong span; the model re-edits with the
+    exact bytes after seeing the real content."""
     ws = Workspace(tmp_path)
     reg, _ = _registry_with(ws)
     ctx = AgentContext(run_id="r", user_id="u")
@@ -491,14 +501,17 @@ async def test_edit_fuzzy_trailing_whitespace(tmp_path):
     r = await reg.dispatch("edit_file",
                            {"path": "f.py", "old_text": "x = 1   ",
                             "new_text": "x = 10"}, ctx)
-    assert r.ok, r.content
+    assert r.ok is False and "未找到 old_text" in r.content
+    assert "行尾空格" in r.content
+    assert ws.read("f.py") == "x = 1\ny = 2\n"          # untouched
+    ok = await reg.dispatch("edit_file",
+                            {"path": "f.py", "old_text": "x = 1",
+                             "new_text": "x = 10"}, ctx)
+    assert ok.ok, ok.content
     assert ws.read("f.py") == "x = 10\ny = 2\n"
-    assert "模糊" in r.content
 
 
-async def test_edit_fuzzy_over_indented_old_text(tmp_path):
-    """Exact substring is primary; the ladder catches over-indented old_text
-    (a substring miss) and replaces whole lines."""
+async def test_edit_strict_over_indented_old_text_rejected(tmp_path):
     ws = Workspace(tmp_path)
     reg, _ = _registry_with(ws)
     ctx = AgentContext(run_id="r", user_id="u")
@@ -506,11 +519,16 @@ async def test_edit_fuzzy_over_indented_old_text(tmp_path):
     r = await reg.dispatch("edit_file",
                            {"path": "f.py", "old_text": "        return 1",
                             "new_text": "    return 2"}, ctx)
-    assert r.ok, r.content
-    assert ws.read("f.py") == "def a():\n    return 2\n"
+    assert r.ok is False and "缩进" in r.content
+    assert ws.read("f.py") == "def a():\n    return 1\n"
+    ok = await reg.dispatch("edit_file",
+                            {"path": "f.py", "old_text": "    return 1",
+                             "new_text": "    return 2"}, ctx)
+    assert ok.ok and ws.read("f.py") == "def a():\n    return 2\n"
 
 
-async def test_edit_fuzzy_unicode_punctuation(tmp_path):
+async def test_edit_strict_unicode_punctuation_rejected(tmp_path):
+    """半角/全角标点差异不再被静默容忍——精确匹配要求逐字符一致。"""
     ws = Workspace(tmp_path)
     reg, _ = _registry_with(ws)
     ctx = AgentContext(run_id="r", user_id="u")
@@ -518,12 +536,16 @@ async def test_edit_fuzzy_unicode_punctuation(tmp_path):
     r = await reg.dispatch("edit_file",
                            {"path": "f.md", "old_text": "结果 - 完成",
                             "new_text": "done"}, ctx)
-    assert r.ok, r.content
-    assert ws.read("f.md") == "done\n"
+    assert r.ok is False and "全角" in r.content
+    assert ws.read("f.md") == "结果 – 完成\n"
+    ok = await reg.dispatch("edit_file",
+                            {"path": "f.md", "old_text": "结果 – 完成",
+                             "new_text": "done"}, ctx)
+    assert ok.ok and ws.read("f.md") == "done\n"
 
 
-async def test_edit_fuzzy_strips_copied_line_number_prefix(tmp_path):
-    """old_text copied verbatim from read_file's numbered output still lands."""
+async def test_edit_strict_copied_line_number_prefix_rejected(tmp_path):
+    """old_text 照抄 read_file 的行号前缀时精确匹配失败，报错指引剥前缀。"""
     ws = Workspace(tmp_path)
     reg, _ = _registry_with(ws)
     ctx = AgentContext(run_id="r", user_id="u")
@@ -531,30 +553,35 @@ async def test_edit_fuzzy_strips_copied_line_number_prefix(tmp_path):
     r = await reg.dispatch("edit_file",
                            {"path": "f.txt", "old_text": "2: change me",
                             "new_text": "changed"}, ctx)
-    assert r.ok, r.content
-    assert ws.read("f.txt") == "keep\nchanged\n"
+    assert r.ok is False and "行号前缀" in r.content
+    assert ws.read("f.txt") == "keep\nchange me\n"
+    ok = await reg.dispatch("edit_file",
+                            {"path": "f.txt", "old_text": "change me",
+                            "new_text": "changed"}, ctx)
+    assert ok.ok and ws.read("f.txt") == "keep\nchanged\n"
 
 
-async def test_edit_fuzzy_multi_match_rejected_with_line_hints(tmp_path):
+async def test_edit_strict_whitespace_divergence_is_zero_hit_not_multi(tmp_path):
+    """带尾随空格的重复段：精确计数为 0（不再是模糊多处命中）；剥掉差异后
+    用 replace_all 显式解决歧义。"""
     ws = Workspace(tmp_path)
     reg, _ = _registry_with(ws)
     ctx = AgentContext(run_id="r", user_id="u")
     ws.write("f.md", "头\n重复段\n中\n重复段\n")
-    # exact match fails only when whitespace diverges → ladder sees both hits
     r = await reg.dispatch("edit_file",
                            {"path": "f.md", "old_text": "重复段 ",
                             "new_text": "X"}, ctx)
-    assert r.ok is False and "2 次" in r.content and "replace_all" in r.content
-    assert "2" in r.content and "4" in r.content
-    # replace_all resolves the ambiguity explicitly
+    assert r.ok is False and "未找到 old_text" in r.content
+    assert ws.read("f.md") == "头\n重复段\n中\n重复段\n"
     r2 = await reg.dispatch("edit_file",
-                            {"path": "f.md", "old_text": "重复段 ",
+                            {"path": "f.md", "old_text": "重复段",
                              "new_text": "X", "replace_all": True}, ctx)
     assert r2.ok and ws.read("f.md") == "头\nX\n中\nX\n"
 
 
-async def test_edit_fuzzy_backslash_double_escaping(tmp_path):
-    """JSON 双重转义的 LaTeX/MathJax 定界符（\\\\( vs \\(）经反斜杠折叠后仍可命中。"""
+async def test_edit_strict_backslash_double_escaping_rejected(tmp_path):
+    """JSON 双重转义的 LaTeX 定界符（\\\\( vs \\(）不再折叠命中——必须按
+    文件里的实际转义层数构造 old_text。"""
     ws = Workspace(tmp_path)
     reg, _ = _registry_with(ws)
     ctx = AgentContext(run_id="r", user_id="u")
@@ -563,15 +590,20 @@ async def test_edit_fuzzy_backslash_double_escaping(tmp_path):
         "edit_file",
         {"path": "f.md", "old_text": "常用 \\\\(p:q\\\\) 表示频率比",
          "new_text": "共振"}, ctx)
-    assert r.ok, r.content
+    assert r.ok is False and "转义" in r.content
+    assert ws.read("f.md") == "常用 \\(p:q\\) 表示频率比\n"
+    ok = await reg.dispatch(
+        "edit_file",
+        {"path": "f.md", "old_text": "常用 \\(p:q\\) 表示频率比",
+         "new_text": "共振"}, ctx)
+    assert ok.ok, ok.content
     assert ws.read("f.md") == "共振\n"
-    assert "模糊" in r.content
 
 
 async def test_edit_zero_hit_shows_nearest_block_hint(tmp_path):
-    """零命中（精确+模糊均失败）时报错展示最相似的实际块（带 read_file
-    风格行号），模型可照抄实际内容重试——真实事故里 docstring 尾部记错
-    曾导致连续 5 次失败。"""
+    """零命中时报错展示最相似的实际块（带 read_file 风格行号），模型可照抄
+    实际内容重试——真实事故里 docstring 尾部记错曾导致连续 5 次失败。
+    诊断是只读的：绝不用猜测的跨度做替换。"""
     ws = Workspace(tmp_path)
     reg, _ = _registry_with(ws)
     ctx = AgentContext(run_id="r", user_id="u")

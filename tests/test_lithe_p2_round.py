@@ -598,13 +598,19 @@ def _ws_reg(tmp_path):
     return ws, reg
 
 
-async def test_edit_file_fuzzy_trailing_blank_alignment(tmp_path):
+async def test_edit_file_strict_trailing_blank_alignment(tmp_path):
+    """严格匹配下，行尾空白使精确子串 "a\n" 无法命中——硬错误而非模糊对齐；
+    按实际内容（含行尾空白）重试后精确落地，也不会多插空行。"""
     ws, reg = _ws_reg(tmp_path)
     ws.write("f.txt", "a  \nb\n")  # 行尾空白使精确子串 "a\n" 无法命中
     res = await reg.dispatch("edit_file", {
         "path": "f.txt", "old_text": "a\n", "new_text": "X\n"}, _ctx())
-    assert res.ok, res.content
-    assert ws.read("f.txt") == "X\nb\n", "模糊命中不得每次多插一个空行"
+    assert res.ok is False and "未找到 old_text" in res.content
+    assert ws.read("f.txt") == "a  \nb\n"
+    exact = await reg.dispatch("edit_file", {
+        "path": "f.txt", "old_text": "a  \n", "new_text": "X\n"}, _ctx())
+    assert exact.ok, exact.content
+    assert ws.read("f.txt") == "X\nb\n"
 
 
 async def test_search_files_skips_overlong_lines(tmp_path):

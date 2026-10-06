@@ -25,7 +25,7 @@ from pathlib import Path
 from collections.abc import Callable, Iterator
 
 from lithe.context import AgentContext
-from lithe.bundles._textmatch import line_span_hits, nearest_block
+from lithe.bundles._textmatch import nearest_block
 from lithe.tools import ToolCategory, ToolRegistry, ToolResult, ToolSpec
 
 _DEFAULT_IGNORED = frozenset({
@@ -412,10 +412,6 @@ def _check_fresh(ctx: AgentContext, ws: Workspace, rel: str) -> ToolResult | Non
     return None
 
 
-# a line copied from read_file's numbered output, e.g. "12: foo"
-_LINE_NO_PREFIX = re.compile(r"^\s*\d+:\s")
-
-
 def _path_params() -> dict:
     return {"type": "object",
             "properties": {"path": {"type": "string",
@@ -441,7 +437,11 @@ def _write_params() -> dict:
 
 def _edit_params() -> dict:
     p = _path_params()
-    p["properties"]["old_text"] = {"type": "string", "description": "要替换的精确文本"}
+    p["properties"]["old_text"] = {
+        "type": "string",
+        "description": ("要替换的精确文本：与文件内容逐字符一致，"
+                        "包括空白、缩进与行尾空格；"
+                        "照抄实际内容，去掉 read_file 输出的 \"N: \" 行号前缀")}
     p["properties"]["new_text"] = {"type": "string", "description": "替换后的文本"}
     p["properties"]["replace_all"] = {
         "type": "boolean",
@@ -759,77 +759,48 @@ def register_file_tools(
             if stale is not None:
                 return stale
             count = content.count(old_text)
-            fuzzy_note = ""
             if count == 0:
-                # Exact substring failed — fall back to a whole-line ladder match
-                # (shared with apply_patch): tolerates stray trailing whitespace,
-                # missing indentation and typographic Unicode punctuation, and
-                # strips "N: " prefixes copied from read_file's numbered output.
-                # The replaced span becomes whole lines, apply_patch-style.
+                # Strict matching: a miss is a hard error, never a fuzzy
+                # guess at "what the model probably meant" — a guessed span
+                # risks editing the wrong location, which is strictly worse
+                # than a failed round-trip. The error teaches the exactness
+                # discipline and, as a read-only diagnostic, shows the most
+                # look-alike block actually on disk so the model can rebuild
+                # old_text from real content instead of mis-remembering it
+                # a second time (the dominant retry-failure pattern).
+                body = (f"在 {rel} 中未找到 old_text（精确匹配）。"
+                        f"old_text 必须与文件内容逐字符一致，"
+                        f"包括空白、缩进与行尾空格："
+                        f"不能带 read_file 输出的 \"N: \" 行号前缀；"
+                        f"注意全角/半角标点与反斜杠转义层数。")
                 lines = content.split("\n")
                 pattern = old_text.split("\n")
-                # Mirror apply_patch's trailing-blank alignment: when the model's
-                # old_text carries a phantom trailing newline, drop it AND the
-                # replacement's counterpart — otherwise every fuzzy hit inserts
-                # one extra blank line per edit.
-                replacement = new_text.split("\n")
-                if pattern and pattern[-1] == "":
-                    pattern = pattern[:-1]
-                    if replacement and replacement[-1] == "":
-                        replacement = replacement[:-1]
-                hits = line_span_hits(lines, pattern) if pattern else []
-                if not hits:
-                    stripped = [_LINE_NO_PREFIX.sub("", p, count=1) for p in pattern]
-                    if any(s != p for s, p in zip(stripped, pattern, strict=True)):
-                        hits = line_span_hits(lines, stripped)
-                        pattern = stripped
-                if not hits:
-                    # Nothing matched, not even fuzzily. Show the most
-                    # look-alike block actually on disk so the model can
-                    # rebuild old_text from real content instead of guessing
-                    # a second time — the dominant retry-failure pattern.
-                    body = (f"在 {rel} 中未找到 old_text"
-                            f"（精确与模糊匹配均未命中）。")
-                    near = nearest_block(lines, pattern) if pattern else None
-                    if near is not None:
-                        start, score = near
-                        n = min(len(pattern), len(lines) - start)
-                        shown: list[str] = []
-                        for j in range(min(n, 10)):
-                            text = lines[start + j]
-                            if len(text) > 160:
-                                text = text[:160] + "…"
-                            shown.append(f"{start + j + 1}: {text}")
-                        more = "\n…" if n > 10 else ""
-                        body += (f"最接近的候选在第 {start + 1}-"
-                                 f"{start + n} 行（相似度 {score:.0%}），"
-                                 f"实际内容：\n"
-                                 + "\n".join(shown) + more
-                                 + "\n请以实际内容为准重新构造 old_text"
-                                 "（可直接复制上面带行号的行并去掉 "
-                                 "'N: ' 前缀），或先 read_file 该区域。")
-                    else:
-                        body += ("请重新 read_file 该文件的相关区域，"
-                                 "按实际内容构造 old_text。")
-                    return ToolResult(False, "未匹配", body)
-                if len(hits) > 1 and not replace_all:
-                    shown = ",".join(str(h + 1) for h in hits[:5])
-                    more = "…" if len(hits) > 5 else ""
-                    return ToolResult(
-                        False, "匹配多处",
-                        f"old_text（模糊整行匹配）在 {rel} 中出现 {len(hits)} 次"
-                        f"（第 {shown}{more} 行）。请提供更长且唯一的 old_text，"
-                        f"或设置 replace_all=true 全部替换。")
-                new_lines = lines[:]
-                for start in reversed(hits):
-                    new_lines[start:start + len(pattern)] = replacement
-                new_content = "\n".join(new_lines)
-                replaced = len(hits)
-                fuzzy_note = "（模糊整行匹配：忽略空白/标点/反斜杠转义差异后定位）"
-            elif count > 1 and not replace_all:
-                # Old behavior (silent replace-all) let one vague old_text clobber
-                # every occurrence. Refuse and show where the matches are so the
-                # model can either widen old_text or pass replace_all explicitly.
+                near = nearest_block(lines, pattern) if pattern else None
+                if near is not None:
+                    start, score = near
+                    n = min(len(pattern), len(lines) - start)
+                    shown: list[str] = []
+                    for j in range(min(n, 10)):
+                        text = lines[start + j]
+                        if len(text) > 160:
+                            text = text[:160] + "…"
+                        shown.append(f"{start + j + 1}: {text}")
+                    more = "\n…" if n > 10 else ""
+                    body += (f"最接近的候选在第 {start + 1}-"
+                             f"{start + n} 行（相似度 {score:.0%}），"
+                             f"实际内容：\n"
+                             + "\n".join(shown) + more
+                             + "\n请以实际内容为准重新构造 old_text"
+                             "（可直接复制上面带行号的行并去掉 "
+                             "'N: ' 前缀），或先 read_file 该区域。")
+                else:
+                    body += "请重新 read_file 该文件的相关区域，按实际内容构造 old_text。"
+                return ToolResult(False, "未匹配", body)
+            if count > 1 and not replace_all:
+                # Refuse and show where the matches are so the model can
+                # either widen old_text or pass replace_all explicitly — a
+                # vague old_text silently replacing every occurrence could
+                # clobber unrelated spots.
                 lines: list[int] = []
                 pos = content.find(old_text)
                 while pos != -1 and len(lines) < 5:
@@ -841,17 +812,16 @@ def register_file_tools(
                     f"old_text 在 {rel} 中出现 {count} 次（第 "
                     f"{','.join(map(str, lines))}{more} 行）。请提供更长且唯一的 "
                     f"old_text，或设置 replace_all=true。")
-            else:
-                new_content = (content.replace(old_text, new_text) if replace_all
-                               else content.replace(old_text, new_text, 1))
-                replaced = count if replace_all else 1
+            new_content = (content.replace(old_text, new_text) if replace_all
+                           else content.replace(old_text, new_text, 1))
+            replaced = count if replace_all else 1
             try:
                 await asyncio.to_thread(ws.write, rel, new_content)
             except (PermissionError, ValueError, RuntimeError) as exc:
                 return ToolResult(False, "写入失败", str(exc))
             await asyncio.to_thread(_record_revision, ctx, ws, rel)
         diff = await asyncio.to_thread(_compact_diff, rel, content, new_content)
-        body = f"已替换 {rel} 中的指定文本（{replaced} 处）{fuzzy_note}。"
+        body = f"已替换 {rel} 中的指定文本（{replaced} 处）。"
         if diff:
             body += "\n\n" + diff
         added, removed = await asyncio.to_thread(_line_delta, content, new_content)
@@ -1082,11 +1052,14 @@ def register_file_tools(
         write_file, reverter=_revert_write, revert_kind="file_write")
     registry.register(
         ToolSpec("edit_file", "局部替换文件中的文本 old_text→new_text（可撤销）。"
+                              "old_text 必须与文件内容精确逐字符匹配——"
+                              "包括空白、缩进和行尾空格；"
+                              "构造时照抄 read_file 输出的行并去掉开头的 \"N: \" 前缀，"
+                              "注意全角/半角标点与反斜杠转义层数。"
                               "old_text 必须唯一；多处匹配时提供更长上下文或设置 "
-                              "replace_all。精确匹配失败时按整行模糊匹配兜底"
-                              "（容忍行尾空白/缩进/中文标点/反斜杠双重转义差异"
-                              "及误带的行号前缀）。",
-                 _edit_params(), ToolCategory.WRITE),
+                              "replace_all。未命中时不会模糊猜测替换位置，"
+                              "会返回最相似的实际内容辅助重建 old_text。",
+         _edit_params(), ToolCategory.WRITE),
         edit_file, reverter=_revert_edit, revert_kind="file_edit")
     registry.register(
         ToolSpec("list_files", "列出工作区文件。", _list_params(), ToolCategory.READ),

@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.1.8 (2026-10-06)
+
+edit_file switches to strict exact matching (the Kilo discipline). The
+previous whole-line fuzzy ladder — tolerant of trailing whitespace,
+indentation drift, full/half-width punctuation, double-escaped backslashes
+and copied `N: ` prefixes — traded safety for round-trips: a guessed span
+can anchor the *wrong* location, which is strictly worse than a failed
+call. A miss is now a hard error.
+
+- **exact match only** — `old_text` must equal the file content character
+  for character, whitespace and indentation included. Zero hits: refuse
+  with the exactness discipline spelled out (no `N: ` prefixes, mind
+  trailing blanks / full-width punctuation / escaping depth) plus, as a
+  read-only diagnostic, the nearest real block with line numbers and a
+  similarity score so the model rebuilds `old_text` from actual content
+  in one round. Multiple hits: still refused with the first five line
+  numbers; `replace_all` remains the explicit opt-in.
+- **tolerance moves where it belongs** — `apply_patch` keeps the
+  whole-line ladder (with `@@` context anchoring), mirroring how
+  high-success-rate agents split the job: strict single-spot edits,
+  tolerant context-anchored patches.
+- **schema/description now teach the discipline** — `old_text` is
+  documented as verbatim content with the `N: ` prefix stripped, and the
+  tool description states that misses never fuzzy-guess a location.
+
+## 0.1.7 (2026-10-06)
+
+The cwd round. A usage audit of a real delegation session showed the model
+burning ~6 of its first 15 `run_command` calls on path failures: commands
+always ran at the workspace root, CI/docs snippets use project-relative
+paths, and the only workaround (`Set-Location <abs>; ...` prefixed onto
+every command) was undiscoverable — nothing told the model where commands
+ran. Modeled on how high-success-rate agents solve it: one tool, a
+workdir parameter, containment by default, approval for the outside.
+
+- **`run_command` takes `cwd`** — a working directory anchored at the
+  workspace root (relative path, or an absolute path inside it); it must
+  exist. `_resolve_cwd` checks containment post-``resolve()`` so ``..``
+  and in-root symlinks cannot slip the anchor, and refuses fast (clear
+  message, no spawn) on missing directories. The tool description now
+  states the default (workspace root) and tells the model to use `cwd`
+  for sub-projects/nested repos instead of stitching `cd` into commands.
+- **external cwd is an approval, not a hard wall** — a cwd resolving
+  outside the workspace routes through the host's existing approver
+  channel (the same human-confirmation path as destructive commands):
+  no approver means refusal with guidance, denial means don't-retry,
+  approval executes there. Containment is a navigation guardrail, not a
+  sandbox — the command itself still runs with full host authority by
+  design; direct `CommandRunner` callers get the same defaults via
+  `run(..., cwd=..., allow_external_cwd=True)` after their own checks.
+- **the host shell note now teaches idioms, not just prohibitions** —
+  PowerShell: chain dependent commands with `cmd1; if ($?) { cmd2 }`,
+  invoke programs in the current directory with a `.\` prefix, use the
+  call operator `& "..."` for spaced paths, prefer file tools over
+  `Get-Content` (or add `-Encoding UTF8`) to avoid CJK mojibake, escape
+  with backticks. POSIX: chain with `&&`, prefer file tools for reads.
+  These were the exact stumbles observed (bare `.\`-less invocations,
+  ANSI-decoded UTF-8 files) that the caveats-only note didn't prevent.
+
 ## 0.1.6 (2026-10-06)
 
 The shell-reliability round, from a usage audit: of 225 real `run_command`
