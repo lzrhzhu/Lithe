@@ -25,7 +25,7 @@ from pathlib import Path
 from collections.abc import Callable, Iterator
 
 from lithe.context import AgentContext
-from lithe.bundles._textmatch import line_span_hits
+from lithe.bundles._textmatch import line_span_hits, nearest_block
 from lithe.tools import ToolCategory, ToolRegistry, ToolResult, ToolSpec
 
 _DEFAULT_IGNORED = frozenset({
@@ -784,7 +784,34 @@ def register_file_tools(
                         hits = line_span_hits(lines, stripped)
                         pattern = stripped
                 if not hits:
-                    return ToolResult(False, "未匹配", f"在 {rel} 中未找到 old_text。")
+                    # Nothing matched, not even fuzzily. Show the most
+                    # look-alike block actually on disk so the model can
+                    # rebuild old_text from real content instead of guessing
+                    # a second time — the dominant retry-failure pattern.
+                    body = (f"在 {rel} 中未找到 old_text"
+                            f"（精确与模糊匹配均未命中）。")
+                    near = nearest_block(lines, pattern) if pattern else None
+                    if near is not None:
+                        start, score = near
+                        n = min(len(pattern), len(lines) - start)
+                        shown: list[str] = []
+                        for j in range(min(n, 10)):
+                            text = lines[start + j]
+                            if len(text) > 160:
+                                text = text[:160] + "…"
+                            shown.append(f"{start + j + 1}: {text}")
+                        more = "\n…" if n > 10 else ""
+                        body += (f"最接近的候选在第 {start + 1}-"
+                                 f"{start + n} 行（相似度 {score:.0%}），"
+                                 f"实际内容：\n"
+                                 + "\n".join(shown) + more
+                                 + "\n请以实际内容为准重新构造 old_text"
+                                 "（可直接复制上面带行号的行并去掉 "
+                                 "'N: ' 前缀），或先 read_file 该区域。")
+                    else:
+                        body += ("请重新 read_file 该文件的相关区域，"
+                                 "按实际内容构造 old_text。")
+                    return ToolResult(False, "未匹配", body)
                 if len(hits) > 1 and not replace_all:
                     shown = ",".join(str(h + 1) for h in hits[:5])
                     more = "…" if len(hits) > 5 else ""
@@ -798,7 +825,7 @@ def register_file_tools(
                     new_lines[start:start + len(pattern)] = replacement
                 new_content = "\n".join(new_lines)
                 replaced = len(hits)
-                fuzzy_note = "（模糊整行匹配：忽略空白/标点差异后定位）"
+                fuzzy_note = "（模糊整行匹配：忽略空白/标点/反斜杠转义差异后定位）"
             elif count > 1 and not replace_all:
                 # Old behavior (silent replace-all) let one vague old_text clobber
                 # every occurrence. Refuse and show where the matches are so the
@@ -1057,7 +1084,8 @@ def register_file_tools(
         ToolSpec("edit_file", "局部替换文件中的文本 old_text→new_text（可撤销）。"
                               "old_text 必须唯一；多处匹配时提供更长上下文或设置 "
                               "replace_all。精确匹配失败时按整行模糊匹配兜底"
-                              "（容忍行尾空白/缩进/中文标点差异及误带的行号前缀）。",
+                              "（容忍行尾空白/缩进/中文标点/反斜杠双重转义差异"
+                              "及误带的行号前缀）。",
                  _edit_params(), ToolCategory.WRITE),
         edit_file, reverter=_revert_edit, revert_kind="file_edit")
     registry.register(

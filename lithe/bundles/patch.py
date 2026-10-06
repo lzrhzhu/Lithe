@@ -240,6 +240,21 @@ from lithe.bundles._textmatch import (  # noqa: E402
 
 # --- deriving new contents --------------------------------------------------
 
+_MAX_FAIL_CHUNKS = 4   # failed chunks listed verbatim before the "more" note
+_MAX_FAIL_LINES = 5    # missing lines echoed per failed chunk
+
+
+def _chunk_error(path: str, seq: int, reason: str,
+                 old_lines: list[str] | None = None) -> str:
+    """One failed chunk, rendered for the combined patch error."""
+    note = f"[{path} 第 {seq + 1} 个 chunk] {reason}"
+    if old_lines:
+        shown = old_lines[:_MAX_FAIL_LINES]
+        note += "：\n" + "\n".join(shown)
+        if len(old_lines) > len(shown):
+            note += f"\n……共 {len(old_lines)} 行"
+    return note
+
 
 def derive_new_contents(
     path: str, chunks: list[UpdateChunk], original_text: str
@@ -256,6 +271,11 @@ def derive_new_contents(
     over an exact look-alike earlier in the file, instead of silently
     editing the wrong site. Updates normalize the file to a trailing newline
     (reference behavior); a UTF-8 BOM survives.
+
+    A chunk that cannot be located does not stop the scan: every failure is
+    recorded and the scan continues from the last good position, so the one
+    final raise reports ALL bad chunks at once instead of surfacing them one
+    retry round-trip at a time.
     """
     bom = original_text.startswith("\ufeff")
     text = original_text[1:] if bom else original_text
@@ -267,14 +287,15 @@ def derive_new_contents(
     # for same-position splices (back-to-front application of equal starts
     # would otherwise reverse two insertions issued in one section).
     splices: list[tuple[int, int, list[str], int]] = []
+    errors: list[str] = []
     search_from = 0
     for seq, chunk in enumerate(chunks):
         if chunk.change_context is not None:
             ctx = seek_sequence(lines, [chunk.change_context], search_from)
             if ctx == -1:
-                raise PatchApplyError(
-                    f"在 {path} 中未找到上下文行 {chunk.change_context!r}"
-                )
+                errors.append(_chunk_error(
+                    path, seq, f"未找到上下文行 {chunk.change_context!r}"))
+                continue
             search_from = ctx + 1
 
         if not chunk.old_lines:  # pure insertion at end of file
@@ -302,17 +323,26 @@ def derive_new_contents(
             if found == -1:
                 found = seek_sequence(lines, pattern, search_from)
             if found == -1:
-                raise PatchApplyError(
-                    f"*** End of File 锚定的 chunk 在 {path} 中未找到：\n"
-                    + "\n".join(chunk.old_lines))
+                errors.append(_chunk_error(
+                    path, seq,
+                    "*** End of File 锚定的 chunk 在文件中未找到",
+                    chunk.old_lines))
+                continue
         else:
             found = seek_sequence(lines, pattern, search_from)
             if found == -1:
-                raise PatchApplyError(
-                    f"在 {path} 中未找到要替换的行：\n" + "\n".join(chunk.old_lines)
-                )
+                errors.append(_chunk_error(
+                    path, seq, "未找到要替换的行", chunk.old_lines))
+                continue
         splices.append((found, len(pattern), new_slice, seq))
         search_from = found + len(pattern)
+
+    if errors:
+        shown = errors[:_MAX_FAIL_CHUNKS]
+        if len(errors) > len(shown):
+            shown.append(f"……另有 {len(errors) - len(shown)} 处 chunk 定位失败")
+        raise PatchApplyError(
+            f"{len(errors)} 处 chunk 定位失败：\n" + "\n".join(shown))
 
     result = list(lines)
     for start, delete_count, insert_lines, _seq in sorted(
@@ -348,8 +378,9 @@ _DESCRIPTION = (
     "Update 节由若干 @@ chunk 组成：@@ 后可跟一行定位上下文；chunk 内空格前缀是"
     "上下文行（上下文中的空行写成单个空格），- 是删除行，+ 是新增行；"
     "*** End of File 表示从文件尾锚定。\n"
-    "定位按 精确→忽略行尾空白→忽略首尾空白→Unicode标点归一 的顺序匹配；"
-    "写盘前先整体校验全部 hunk，任何一处定位失败都不会改动任何文件。"
+    "定位按 精确→忽略行尾空白→忽略首尾空白→Unicode标点归一→反斜杠折叠 的顺序匹配；"
+    "写盘前先整体校验全部 hunk，任何 hunk 定位失败时一次列出全部失败 chunk，"
+    "且不会改动任何文件。"
 )
 
 
@@ -406,6 +437,11 @@ def register_apply_patch_tool(
         # it is in-memory — but its inputs (current()/freshness) are read
         # under the lock so the commit lands on exactly what was checked.
         async with _ws_write_lock(ctx):
+            # Per-hunk location failures are collected across ALL files so
+            # one rejection lists every bad chunk (see derive_new_contents);
+            # a failure skips just its own section — nothing is written
+            # unless the list is empty at the end (all-or-nothing).
+            apply_errors: list[str] = []
             try:
                 for hunk in hunks:
                     ws.safe_path(hunk.path)  # traversal check up front
@@ -424,7 +460,8 @@ def register_apply_patch_tool(
                     elif isinstance(hunk, DeleteFile):
                         old = current(hunk.path)
                         if old is None:
-                            raise PatchApplyError(f"文件不存在：{hunk.path}")
+                            apply_errors.append(f"[{hunk.path}] 文件不存在")
+                            continue
                         overlay[hunk.path] = None
                         ui.append(_file_change("delete", hunk.path, old, None))
                         applied.append(f"D {hunk.path}")
@@ -433,8 +470,14 @@ def register_apply_patch_tool(
                             ws.safe_path(hunk.move_path)
                         old = current(hunk.path)
                         if old is None:
-                            raise PatchApplyError(f"文件不存在：{hunk.path}")
-                        new_text = derive_new_contents(hunk.path, hunk.chunks, old).new_text
+                            apply_errors.append(f"[{hunk.path}] 文件不存在")
+                            continue
+                        try:
+                            new_text = derive_new_contents(
+                                hunk.path, hunk.chunks, old).new_text
+                        except PatchApplyError as exc:
+                            apply_errors.append(str(exc))
+                            continue
                         if hunk.move_path:
                             dest_old = current(hunk.move_path)
                             overlay[hunk.move_path] = new_text
@@ -457,6 +500,10 @@ def register_apply_patch_tool(
                 return ToolResult(False, "非法路径", f"patch 未做任何修改。{exc}")
             except (OSError, RuntimeError, ValueError) as exc:
                 return ToolResult(False, "预检失败", f"patch 未做任何修改：{exc}")
+            if apply_errors:
+                return ToolResult(
+                    False, "未应用",
+                    "patch 未做任何修改。\n" + "\n".join(apply_errors))
 
             # Phase 2 — commit: one write/delete per touched path. A mid-commit
             # failure reports what landed (the events carry full undo data).

@@ -9,6 +9,8 @@ lands instead of failing the edit:
 2. ignore trailing whitespace (``rstrip``)
 3. ignore leading/trailing whitespace (``strip``)
 4. fold typographic Unicode punctuation to ASCII look-alikes, then compare
+5. also collapse runs of backslashes to one (model-side double escaping of
+   LaTeX/MathJax delimiters in tool-call JSON)
 
 Each pass scans the whole candidate range, so a weaker comparator never
 shadows a stronger hit at a later offset. ``apply_patch``'s chunk seeking and
@@ -16,7 +18,9 @@ shadows a stronger hit at a later offset. ``apply_patch``'s chunk seeking and
 """
 from __future__ import annotations
 
+import difflib
 import operator
+import re
 from collections.abc import Callable
 
 
@@ -32,12 +36,28 @@ def normalize_unicode(s: str) -> str:
     return s
 
 
-# Ordered exact → rstrip → strip → unicode-folded.
+_BACKSLASH_RUN = re.compile(r"\\+")
+
+
+def normalize_escapes(s: str) -> str:
+    """Collapse runs of backslashes to a single backslash.
+
+    Models routinely double-escape LaTeX/MathJax delimiters in tool-call
+    JSON — ``\\(`` arrives in ``old_text`` while the file holds ``\\(``
+    (or a quadrupled ``\\\\(`` collapses the same way). Folding both sides
+    makes the comparison immune to that mirror-image escaping.
+    """
+    return _BACKSLASH_RUN.sub(lambda _m: chr(92), s)
+
+
+# Ordered exact → rstrip → strip → unicode-folded → backslash-folded.
 COMPARATORS: tuple[Callable[[str, str], bool], ...] = (
     operator.eq,
     lambda a, b: a.rstrip() == b.rstrip(),
     lambda a, b: a.strip() == b.strip(),
     lambda a, b: normalize_unicode(a.strip()) == normalize_unicode(b.strip()),
+    lambda a, b: normalize_escapes(normalize_unicode(a.strip()))
+    == normalize_escapes(normalize_unicode(b.strip())),
 )
 
 
@@ -113,3 +133,53 @@ def line_span_hits(lines: list[str], pattern: list[str]) -> list[int]:
         if hits:
             return hits
     return []
+
+
+def nearest_block(lines: list[str], pattern: list[str], *,
+                  probe_floor: float = 0.5, block_floor: float = 0.4,
+                  anchors: int = 3) -> tuple[int, float] | None:
+    """Best-effort location of the pattern's *nearest look-alike* block.
+
+    Unlike :func:`seek_sequence` this never claims a match: it returns the
+    0-based start and mean per-line similarity (0..1) of the most look-alike
+    window, so a failed edit can show the model what is actually on disk
+    instead of failing with a bare "not found". ``None`` when nothing is
+    even remotely similar.
+
+    Cheap by design: the longest non-blank pattern line is the probe; only
+    lines scoring ``probe_floor``+ against it (length-gated before the
+    O(len_a*len_b) ratio) are evaluated as block anchors, best ``anchors``
+    of them get full window scoring, the best window wins.
+    """
+    if not pattern or not lines:
+        return None
+    probe_idx, probe = max(
+        ((i, p) for i, p in enumerate(pattern) if p.strip()),
+        key=lambda ip: len(ip[1]), default=(0, None))
+    if probe is None:
+        return None
+    span = min(len(pattern), len(lines))
+    probe_body = probe.strip()
+    candidates: list[tuple[float, int]] = []
+    for i, line in enumerate(lines):
+        body = line.strip()
+        if abs(len(body) - len(probe_body)) > len(probe_body) + 8:
+            continue  # ratio could not reach the floor; skip the cost
+        ratio = difflib.SequenceMatcher(None, body, probe_body).ratio()
+        if ratio >= probe_floor:
+            candidates.append((ratio, i))
+    best: tuple[int, float] | None = None
+    for _, anchor in sorted(candidates, reverse=True)[:anchors]:
+        # Re-anchor the window so the probe lines up with its own position
+        # in the pattern (the probe is not necessarily the first line).
+        start = min(max(anchor - probe_idx, 0), len(lines) - span)
+        score = sum(
+            difflib.SequenceMatcher(
+                None, lines[start + j].strip(),
+                pattern[j].strip()).ratio()
+            for j in range(span)) / span
+        if best is None or score > best[1]:
+            best = (start, score)
+    if best is None or best[1] < block_floor:
+        return None
+    return best

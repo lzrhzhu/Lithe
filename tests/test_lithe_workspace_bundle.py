@@ -553,6 +553,65 @@ async def test_edit_fuzzy_multi_match_rejected_with_line_hints(tmp_path):
     assert r2.ok and ws.read("f.md") == "头\nX\n中\nX\n"
 
 
+async def test_edit_fuzzy_backslash_double_escaping(tmp_path):
+    """JSON 双重转义的 LaTeX/MathJax 定界符（\\\\( vs \\(）经反斜杠折叠后仍可命中。"""
+    ws = Workspace(tmp_path)
+    reg, _ = _registry_with(ws)
+    ctx = AgentContext(run_id="r", user_id="u")
+    ws.write("f.md", "常用 \\(p:q\\) 表示频率比\n")
+    r = await reg.dispatch(
+        "edit_file",
+        {"path": "f.md", "old_text": "常用 \\\\(p:q\\\\) 表示频率比",
+         "new_text": "共振"}, ctx)
+    assert r.ok, r.content
+    assert ws.read("f.md") == "共振\n"
+    assert "模糊" in r.content
+
+
+async def test_edit_zero_hit_shows_nearest_block_hint(tmp_path):
+    """零命中（精确+模糊均失败）时报错展示最相似的实际块（带 read_file
+    风格行号），模型可照抄实际内容重试——真实事故里 docstring 尾部记错
+    曾导致连续 5 次失败。"""
+    ws = Workspace(tmp_path)
+    reg, _ = _registry_with(ws)
+    ctx = AgentContext(run_id="r", user_id="u")
+    actual = ('async def undo(cfg):\n'
+              '    """Revert a run\'s mutations; returns how many actions'
+              ' were reverted."""\n'
+              '    reg = build_registry(cfg)\n')
+    ws.write("agent.py", actual)
+    # 模型凭记忆重构：首行一致、docstring 尾部不同
+    r = await reg.dispatch(
+        "edit_file",
+        {"path": "agent.py",
+         "old_text": ('async def undo(cfg):\n'
+                      '    """Revert a run\'s mutations; returns the'
+                      ' reverted count."""\n'
+                      '    reg = build_registry(cfg)\n'),
+         "new_text": "X"}, ctx)
+    assert r.ok is False
+    assert "未找到 old_text" in r.content
+    assert "最接近的候选" in r.content
+    assert "how many actions were reverted" in r.content  # 实际内容被展示
+    assert "2: " in r.content  # read_file 风格行号，便于照抄去前缀重试
+    assert "read_file" in r.content
+    assert ws.read("agent.py") == actual  # 未改动
+
+
+async def test_edit_zero_hit_without_similar_line_advises_re_read(tmp_path):
+    """完全无相似内容时不展示候选，只引导重新 read_file。"""
+    ws = Workspace(tmp_path)
+    reg, _ = _registry_with(ws)
+    ctx = AgentContext(run_id="r", user_id="u")
+    ws.write("f.txt", "alpha\nbeta\n")
+    r = await reg.dispatch(
+        "edit_file", {"path": "f.txt", "old_text": "zzz qqq",
+                      "new_text": "x"}, ctx)
+    assert r.ok is False
+    assert "未找到 old_text" in r.content and "read_file" in r.content
+    assert "最接近的候选" not in r.content
+
+
 # --- stale-content guard (optimistic concurrency) -----------------------------
 
 

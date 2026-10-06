@@ -1230,6 +1230,39 @@ def test_normalize_assistant_keeps_reasoning():
     assert "reasoning" not in out2
 
 
+def test_runtime_helper_extraction_keeps_compatibility_imports():
+    import asyncio
+    import queue
+
+    from lithe.runtime import (
+        _drain_inbox,
+        _normalize_assistant,
+        _parse_args,
+        _stop_triggered,
+    )
+
+    args, error = _parse_args({"function": {"arguments": '{"x": 1}'}})
+    assert args == {"x": 1} and error is None
+    args, error = _parse_args({"function": {"arguments": "[]"}})
+    assert args == {} and error is not None
+
+    async_stop = asyncio.Event()
+    assert not _stop_triggered(async_stop)
+    async_stop.set()
+    assert _stop_triggered(async_stop)
+    assert _stop_triggered(lambda: True)
+
+    inbox = queue.Queue()
+    inbox.put("steer")
+    assert asyncio.run(_drain_inbox(inbox)) == ["steer"]
+    assert asyncio.run(_drain_inbox(inbox)) == []
+
+    call = {"function": {"name": "read_file", "arguments": "{}"}}
+    normalized = _normalize_assistant({"tool_calls": [call]})
+    assert normalized["tool_calls"][0]["id"].startswith("call_")
+    assert call["id"] == normalized["tool_calls"][0]["id"]
+
+
 def test_llm_config_rejects_bad_reasoning_scope():
     import pytest as _pytest
     with _pytest.raises(ValueError):

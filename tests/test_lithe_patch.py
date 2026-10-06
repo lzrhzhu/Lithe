@@ -198,6 +198,22 @@ def test_derive_missing_lines_raises_with_echo():
         derive_new_contents("t.txt", [_chunk(["absent"], [])], "one\n")
 
 
+def test_derive_reports_all_failed_chunks():
+    """定位失败不再首个即抛：一次 raise 列出全部坏 chunk（带序号与原文）。"""
+    original = "one\ntwo\nthree\n"
+    chunks = [
+        _chunk(["absent"], []),
+        _chunk(["two"] + [f"pad {i}" for i in range(6)], []),
+    ]
+    with pytest.raises(PatchApplyError) as ei:
+        derive_new_contents("t.txt", chunks, original)
+    msg = str(ei.value)
+    assert "2 处 chunk 定位失败" in msg
+    assert "第 1 个 chunk" in msg and "absent" in msg
+    assert "第 2 个 chunk" in msg and "two" in msg
+    assert "……共 7 行" in msg  # 超出逐行回显上限时给出总行数
+
+
 def test_derive_preserves_bom_and_normalizes_trailing_newline():
     original = "\ufeffa\nb"  # no trailing newline
     out = derive_new_contents("b.txt", [_chunk(["b"], ["c"])], original)
@@ -371,6 +387,27 @@ async def test_unmatched_hunk_leaves_workspace_untouched(tmp_path):
     assert not r.ok
     assert "未做任何修改" in r.content
     assert ws.read("good.txt") == "keep\n"  # first hunk was NOT applied
+
+
+async def test_apply_patch_lists_failures_across_files(tmp_path):
+    """两个文件各有一个坏 chunk：一次拒绝同时点名两处，且零落盘——
+    不再逐轮只暴露第一个失败。"""
+    ws = Workspace(tmp_path)
+    ws.write("a.txt", "aaa\n")
+    ws.write("b.txt", "bbb\n")
+    reg, _ = _registry_with(ws)
+    r = await reg.dispatch(
+        "apply_patch",
+        {"patch_text": _wrap(
+            "*** Update File: a.txt\n@@\n-nope-a\n+A\n"
+            "*** Update File: b.txt\n@@\n-nope-b\n+B")},
+        _ctx(),
+    )
+    assert not r.ok
+    assert "未做任何修改" in r.content
+    assert "a.txt" in r.content and "nope-a" in r.content
+    assert "b.txt" in r.content and "nope-b" in r.content
+    assert ws.read("a.txt") == "aaa\n" and ws.read("b.txt") == "bbb\n"
 
 
 async def test_apply_patch_summary_carries_line_delta(tmp_path):

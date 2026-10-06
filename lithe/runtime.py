@@ -20,10 +20,8 @@ import contextlib
 import itertools
 import json
 import logging
-import queue as _queue
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Any
 from collections.abc import AsyncIterator, Callable
@@ -39,6 +37,18 @@ from lithe.context_window import (
 # Re-export only: tests import the omission note from the runtime module.
 from lithe.context_window import _OMITTED_TURNS_NOTE  # noqa: F401
 from lithe.modes import ToolCategory
+from lithe.runtime_accounting import (
+    as_int as _as_int,
+    call_cost as _call_cost,
+    computed_cost as _computed_cost,  # noqa: F401 — compatibility re-export
+    gateway_cost as _gateway_cost,  # noqa: F401 — compatibility re-export
+)
+from lithe.runtime_helpers import (
+    drain_inbox as _drain_inbox,
+    normalize_assistant as _normalize_assistant,
+    parse_args as _parse_args,
+    stop_triggered as _stop_triggered,
+)
 from lithe.tools import ToolRegistry, ToolResult
 from lithe.transports import LLMTransport, make_transport
 
@@ -194,181 +204,6 @@ class RunStats:
         if not self.context_window or not self.context_tokens:
             return None
         return round(100.0 * self.context_tokens / self.context_window, 1)
-
-
-def _parse_args(tc: dict) -> tuple[dict, str | None]:
-    """Parse one tool_call's ``arguments`` into ``(args, error)``.
-
-    A malformed arguments string (not valid JSON, or valid JSON that is not an
-    object) yields ``( {}, message )`` so the runtime can hand the error back
-    to the model as a failed tool result instead of silently executing the
-    tool with empty args.
-    """
-    fn = tc.get("function")
-    if not isinstance(fn, dict):
-        return {}, None
-    raw = fn.get("arguments", "")
-    if isinstance(raw, dict):
-        return raw, None
-    if not raw:
-        return {}, None
-    try:
-        parsed = json.loads(raw)
-    except Exception as exc:
-        return {}, f"{exc}（原文片段：{raw[:120]!r}）"
-    if not isinstance(parsed, dict):
-        return {}, f"arguments 应为 JSON 对象，得到 {type(parsed).__name__}"
-    return parsed, None
-
-
-def _stop_triggered(stop) -> bool:
-    """A stop handle is an ``asyncio.Event`` / ``threading.Event``-like object
-    (anything with ``is_set()``) or a zero-arg callable returning truthiness."""
-    if stop is None:
-        return False
-    is_set = getattr(stop, "is_set", None)
-    if callable(is_set):
-        return bool(is_set())
-    if callable(stop):
-        return bool(stop())
-    return bool(stop)
-
-
-async def _drain_inbox(inbox) -> list[str]:
-    """Non-blocking drain of the steering inbox.
-
-    Accepts anything with a ``get_nowait()`` — an ``asyncio.Queue`` (same
-    loop) or a ``queue.Queue`` (a cross-thread host pushing from another
-    thread; thread-safe by construction). An empty queue ends the drain; a
-    broken inbox logs and returns what it had rather than killing the run —
-    steering is an auxiliary channel, never a load-bearing one.
-    """
-    if inbox is None:
-        return []
-    out: list[str] = []
-    while True:
-        try:
-            out.append(inbox.get_nowait())
-        except (asyncio.QueueEmpty, _queue.Empty):
-            return out
-        except Exception:  # noqa: BLE001 — a broken inbox must not kill the run
-            log.warning("steering inbox drain failed (ignored)",
-                        exc_info=True)
-            return out
-
-
-def _normalize_assistant(msg: dict) -> dict:
-    """Keep only the OpenAI-relevant keys for the next request.
-
-    This is the single point where a missing ``tool_call`` id is synthesized
-    (``call_`` + uuid fragment): some gateways omit ids on non-streamed
-    calls, and the streaming assembler deliberately leaves them ``None``
-    rather than minting per-response ``call_0``-style ids that collide across
-    steps. Without an id the paired tool result carries
-    ``tool_call_id: null`` and the next request is rejected with a 400. The
-    synthesis mutates the caller's tool_call dicts in place, so the recorded
-    turn, the display events and the in-memory ``messages`` all agree on one
-    id.
-
-    Reasoning items (Responses protocol) ride the message under the
-    ``reasoning`` key: kept verbatim so the next call in the same tool loop
-    can pass them back, and so sinks can persist them. They are opaque to
-    this kernel — never parsed or rewritten.
-    """
-    out: dict[str, Any] = {"role": "assistant", "content": msg.get("content") or ""}
-    reasoning = msg.get("reasoning")
-    if reasoning:
-        out["reasoning"] = reasoning
-    tcs = msg.get("tool_calls")
-    if tcs:
-        norm: list[dict] = []
-        for tc in tcs:
-            fn = tc.get("function") if isinstance(tc, dict) else None
-            if not isinstance(fn, dict):
-                continue
-            tc_id = tc.get("id")
-            if not isinstance(tc_id, str) or not tc_id:
-                tc_id = "call_" + uuid.uuid4().hex[:20]
-                tc["id"] = tc_id
-            norm.append({
-                "id": tc_id,
-                "type": tc.get("type", "function"),
-                "function": {
-                    "name": fn.get("name"),
-                    "arguments": fn.get("arguments", ""),
-                },
-            })
-        if norm:
-            out["tool_calls"] = norm
-    return out
-
-
-def _as_int(val) -> int:
-    """Coerce a (possibly dirty, custom-transport-supplied) usage value.
-
-    Built-in transports sanitize via ``norm_usage``; a custom ``LLMTransport``
-    may return raw shapes ("1,234", [1], None-ish objects). A parse failure
-    must degrade to 0, never escape the run loop.
-    """
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _gateway_cost(data: dict) -> float | None:
-    """Cost as reported by the gateway, when it reports one at all.
-
-    Returns ``None`` when no cost field is present (OpenAI's API and many
-    gateways never send one) so the caller can fall back to a host-declared
-    price table — a reported 0.0 is a real answer ("this call was free"),
-    not the same as silence.
-    """
-    usage = data.get("usage") or {}
-    breakdown = usage.get("cost_breakdown") or {}
-    for src in (breakdown.get("total_cost"), usage.get("cost"), data.get("cost")):
-        if src is not None:
-            try:
-                return float(src)
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def _computed_cost(pricing: dict | None, usage: dict) -> float:
-    """Cost from a host-declared per-1M-token price table (``LLMConfig.pricing``).
-
-    Cached input tokens are billed at ``cached_prompt`` when given, else at
-    the ``prompt`` price — over-counting a cache discount is the safe
-    direction for a budget. Returns 0.0 without a table, matching the
-    gateway-silent "unknown" accounting.
-    """
-    if not pricing:
-        return 0.0
-    p = pricing.get("prompt")
-    c = pricing.get("completion")
-    if p is None and c is None:
-        return 0.0
-    prompt_tok = _as_int(usage.get("prompt_tokens"))
-    comp_tok = _as_int(usage.get("completion_tokens"))
-    cached = min(_as_int(usage.get("cached_tokens")), prompt_tok)
-    cost = 0.0
-    if p is not None:
-        cached_price = pricing.get("cached_prompt", p)
-        cost += ((prompt_tok - cached) / 1e6) * p \
-            + (cached / 1e6) * cached_price
-    if c is not None:
-        cost += (comp_tok / 1e6) * c
-    return cost
-
-
-def _call_cost(cfg: LLMConfig, usage: dict) -> float:
-    """Per-call cost: the gateway's own number when it sends one, else the
-    host's price table, else 0.0 (unknown)."""
-    reported = _gateway_cost({"usage": usage})
-    if reported is not None:
-        return reported
-    return _computed_cost(cfg.pricing, usage)
 
 
 class AgentRuntime:
