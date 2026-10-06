@@ -86,7 +86,7 @@ class _FakeRunner:
         self.runs: list[str] = []
         self.timeout = 30.0
 
-    async def run(self, workspace, command, shell, stdin):
+    async def run(self, workspace, command, shell, stdin, timeout=None):
         self.runs.append(command)
         return {"stdout": "", "stderr": "", "exit_code": 0,
                 "timed_out": False, "duration": 0.0}

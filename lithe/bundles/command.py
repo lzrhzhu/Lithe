@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import codecs
+import locale
 import os
 import re
 import shutil
@@ -16,18 +16,36 @@ from lithe.context import AgentContext
 from lithe.tools import ToolCategory, ToolRegistry, ToolResult, ToolSpec
 
 
-_SHELLS = {"auto", "bash", "sh", "powershell", "cmd"}
+_SHELLS = {"auto", "bash", "sh", "powershell", "cmd", "wsl"}
+# Longest per-call timeout the model may request (seconds). The registry-level
+# ToolSpec timeout sits above it so the runner's internal, output-preserving
+# timeout always fires before asyncio's hard task cancellation.
+_MAX_CALL_TIMEOUT = 1800.0
 _PROXY_ENV = {"http_proxy", "https_proxy", "no_proxy"}
 _UNIX_ENV = {
     "path", "home", "user", "logname", "shell", "term", "lang", "language",
     "lc_all", "lc_ctype", "tmpdir",
 }
+# Account identity vars (USERNAME / USERDOMAIN / COMPUTERNAME) are load-bearing
+# for real tooling — icacls/ACL checks, git and pip user-path resolution all
+# read them; stripping them broke pytest runs of this very project in the wild
+# ("unable to determine current Windows account"). PSModulePath keeps
+# PowerShell from re-scanning modules (the #< CLIXML "Preparing modules"
+# stderr spam plus 1-3s startup per call). SYSTEMDRIVE/OS are read by many
+# installers. None of these carry secrets.
 _WINDOWS_ENV = {
-    "path", "systemroot", "windir", "comspec", "pathext", "userprofile",
-    "homedrive", "homepath", "temp", "tmp", "appdata", "localappdata",
-    "programdata", "programfiles", "programfiles(x86)", "processor_architecture",
-    "number_of_processors", "public", "commonprogramfiles",
+    "path", "systemroot", "systemdrive", "windir", "os", "comspec", "pathext",
+    "userprofile", "homedrive", "homepath", "temp", "tmp", "appdata",
+    "localappdata", "programdata", "programfiles", "programfiles(x86)",
+    "programw6432", "processor_architecture", "processor_identifier",
+    "processor_level", "processor_revision", "number_of_processors", "public",
+    "commonprogramfiles", "commonprogramfiles(x86)", "commonprogramw6432",
+    "username", "userdomain", "computername", "psmodulepath",
 }
+# Opinionated runtime defaults for every child: children speaking UTF-8 is
+# what makes the UTF-8 output decode reliable (on CP936 hosts a Python child
+# pipes GBK otherwise). Explicit ``extra`` entries still win.
+_RUNTIME_DEFAULTS = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
 
 
 def _command_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -37,6 +55,7 @@ def _command_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
         if key.lower() in allowed or key.lower() in _PROXY_ENV
         or (os.name != "nt" and key.lower().startswith("lc_"))
     }
+    env.update(_RUNTIME_DEFAULTS)
     env.update({str(key): str(value) for key, value in (extra or {}).items()})
     return env
 
@@ -45,11 +64,104 @@ def _find_shell(candidates: tuple[str, ...]) -> str | None:
     return next((path for name in candidates if (path := shutil.which(name))), None)
 
 
+def _is_wsl_bash(path: str) -> bool:
+    """True for WSL's bash stub under the Windows directory (System32/SysWOW64).
+
+    That exe runs commands inside the Linux subsystem — a different OS with
+    its own interpreters, PATH and filesystem view; a "bash" that silently
+    crosses that boundary is the single largest failure source observed in
+    real usage (python not found, venvs unusable on /mnt drvfs, ...).
+    """
+    low = str(path).replace("/", "\\").lower()
+    windir = (os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+              or r"c:\windows").replace("/", "\\").lower().rstrip("\\")
+    return low.startswith(windir + "\\") and (
+        "\\system32\\" in low or low.endswith("\\system32")
+        or "\\syswow64\\" in low or low.endswith("\\syswow64"))
+
+
+def _windows_bash() -> str | None:
+    """A Windows-side bash (Git for Windows), never WSL's stub.
+
+    Git-Bash is the only "bash on Windows" that shares this OS's filesystem,
+    PATH and interpreters, so it is the sole correct target when the model
+    insists on POSIX syntax. Missing Git-Bash is *not* an error to paper
+    over: the caller fails loudly with rewrite guidance instead (see
+    ``_bash_unavailable_message``).
+    """
+    found = _find_shell(("bash",))
+    if found and not _is_wsl_bash(found):
+        return found
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        base = os.environ.get(env_name)
+        if not base:
+            continue
+        cand = Path(base) / "Git" / "bin" / "bash.exe"
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
+def _bash_unavailable_message() -> str:
+    has_wsl = _find_shell(("wsl",)) is not None
+    msg = ("未找到 Windows 侧的 bash（Git for Windows）。"
+           "已排除 WSL 的 bash.exe——它运行在 Linux 子系统中，"
+           "与本机的文件、PATH 和解释器不互通。")
+    if has_wsl:
+        msg += ('如确需 POSIX 环境请显式 shell="wsl"；'
+                "否则请把命令改写为 PowerShell 语法后重试。")
+    else:
+        msg += "请把命令改写为 PowerShell 语法后重试。"
+    return msg
+
+
+def _host_shell_note() -> str:
+    """Host-platform fact sheet appended to the run_command description.
+
+    Resolved once at registration from what is actually installed, so the
+    model never guesses the platform or dialect: auto's real target, the
+    PowerShell 5.1 caveats (no ``&&`` / ``VAR=x cmd`` / POSIX utils), the
+    shells this machine really has. Windows Terminal is a console host, not
+    a shell — irrelevant here; pwsh/powershell/cmd are the guaranteed floor.
+    """
+    if os.name != "nt":
+        auto = "bash" if _find_shell(("bash",)) else "sh"
+        return f"当前宿主是 Linux/macOS（POSIX），auto 使用 {auto}。"
+    has_pwsh = _find_shell(("pwsh",)) is not None
+    has_ps = has_pwsh or _find_shell(("powershell",)) is not None
+    git_bash = _windows_bash()
+    has_wsl = _find_shell(("wsl",)) is not None
+    avail = (["powershell", "cmd"] if has_ps else ["cmd"])
+    if git_bash:
+        avail.append("bash（Git-Bash）")
+    if has_wsl:
+        avail.append("wsl（Linux 子系统，路径与解释器和 Windows 侧不同）")
+    note = "当前宿主是 Windows"
+    if has_ps:
+        note += "，auto 使用 powershell"
+        if not has_pwsh:
+            note += ("（Windows PowerShell 5.1：不支持 && 连接、VAR=x 前缀和 "
+                     "tail/head/grep 等 POSIX 写法）")
+    else:
+        note += "，auto 使用 cmd"
+    note += f"；本机可用 shell：{'、'.join(avail)}"
+    if not git_bash and has_wsl:
+        note += ('；本机没有 Windows 侧 bash，shell="bash" 会直接报错——'
+                 "POSIX 命令请改写为 PowerShell，或显式 shell=\"wsl\" 在 Linux "
+                 "子系统中执行")
+    return note + "。"
+
+
 def _powershell_script(command: str) -> str:
     return (
         "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); "
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
         "$OutputEncoding = [Console]::OutputEncoding; "
+        # A non-interactive host with redirected stderr serializes progress
+        # records as #< CLIXML noise into stderr ("Preparing modules for
+        # first use", ...) — silence them instead of making the model parse
+        # XML garbage.
+        "$ProgressPreference = 'SilentlyContinue'; "
         + command
     )
 
@@ -69,9 +181,18 @@ def _command_argv(command: str, shell: str = "auto", *, windows: bool | None = N
         else:
             selected = "bash" if _find_shell(("bash",)) else "sh"
     if selected == "bash":
-        executable = _find_shell(("bash",))
+        # Windows: only a same-OS bash counts (Git-Bash). WSL's bash.exe is
+        # excluded by _windows_bash; falling back to it silently sent commands
+        # into another OS — the dominant failure class in real usage. No
+        # Windows-side bash at all: fail loudly with actionable guidance
+        # rather than silently switching dialects (a POSIX command that runs
+        # "successfully" under PowerShell-ish semantics is worse than an
+        # error the model can self-correct from).
+        executable = _windows_bash() if is_windows else _find_shell(("bash",))
         if executable:
             return [executable, "-lc", command]
+        if is_windows:
+            raise FileNotFoundError(_bash_unavailable_message())
     elif selected == "sh":
         executable = _find_shell(("sh",))
         if executable:
@@ -100,43 +221,79 @@ def _command_argv(command: str, shell: str = "auto", *, windows: bool | None = N
             if is_windows:
                 command = "chcp 65001 >NUL & " + command
             return [executable, "/d", "/s", "/c", command]
+    elif selected == "wsl":
+        # Explicit cross-boundary choice: the command runs inside the Linux
+        # subsystem. wsl.exe translates the Windows cwd to /mnt/<drive>/...
+        # for the child; killing the Windows relay does not guarantee the
+        # Linux-side process dies, so long-running WSL work should mind the
+        # timeout.
+        if not is_windows:
+            raise ValueError('shell="wsl" 仅在 Windows 宿主上可用')
+        executable = _find_shell(("wsl",))
+        if executable:
+            return [executable, "-e", "bash", "-lc", command]
     raise FileNotFoundError(f"未找到可用的 {selected} 执行器")
 
 
-async def _read_capped(stream, limit: int) -> str:
-    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+def _fallback_encoding() -> str | None:
+    """Locale encoding used when a child's bytes are not valid UTF-8.
+
+    On CP936 hosts native tools still emit locale-encoded output despite the
+    UTF-8 setup around them; decoding that as UTF-8 produced mojibake
+    (“δ��װ Numba...”). POSIX hosts are UTF-8 by convention — None there.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        return locale.getpreferredencoding(False) or None
+    except Exception:  # noqa: BLE001 — diagnostics must not break dispatch
+        return None
+
+
+def _decode_output(data: bytes, fallback: str | None) -> str:
+    """Decode a child's output: UTF-8 first, locale fallback, then replace."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    if fallback:
+        try:
+            return data.decode(fallback)
+        except (UnicodeDecodeError, LookupError):
+            pass
+    return data.decode("utf-8", "replace")
+
+
+async def _read_capped(stream, limit: int, fallback: str | None = None) -> str:
+    """Read one output pipe to EOF, keeping head+tail when it overflows.
+
+    Buffers bytes (bounded: first + tail windows) and decodes at the end so a
+    non-UTF-8 child can fall back to the locale encoding — an incremental
+    UTF-8 decoder cannot retry. For every encoding a byte window of N bytes
+    decodes to ≤ N chars, so the char cap holds unchanged.
+    """
     cap = max(1, limit)
     first_limit = max(1, cap // 2)
     tail_limit = max(1, cap - first_limit)
-    complete = ""
-    first = ""
-    tail = ""
+    complete = b""
+    first = b""
+    tail = b""
     total = 0
-    while chunk := await stream.read(4096):
-        text = decoder.decode(chunk)
-        total += len(text)
+    while chunk := await stream.read(65536):
+        total += len(chunk)
         if first:
-            tail = (tail + text)[-tail_limit:]
+            tail = (tail + chunk)[-tail_limit:]
         else:
-            complete += text
+            complete += chunk
             if len(complete) > cap:
                 first = complete[:first_limit]
                 tail = complete[-tail_limit:]
-                complete = ""
-    final = decoder.decode(b"", final=True)
-    total += len(final)
-    if final:
-        if first:
-            tail = (tail + final)[-tail_limit:]
-        else:
-            complete += final
-            if len(complete) > cap:
-                first = complete[:first_limit]
-                tail = complete[-tail_limit:]
+                complete = b""
     if not first:
-        return complete
-    marker = f"\n…[输出过长，共 {total} 字符，已省略中间部分]…\n"
-    return first + marker + tail
+        return _decode_output(complete, fallback)
+    marker = f"\n…[输出过长，共 {total} 字节，已省略中间部分]…\n"
+    return (_decode_output(first, fallback) + marker
+            + _decode_output(tail, fallback))
 
 
 async def _write_stdin(stream, value: str | None) -> None:
@@ -183,7 +340,7 @@ class CommandRunner:
     def __init__(
         self,
         *,
-        timeout: float = 120.0,
+        timeout: float = 300.0,
         max_output: int = 16000,
         extra_env: Mapping[str, str] | None = None,
     ):
@@ -191,7 +348,20 @@ class CommandRunner:
         self.max_output = int(max_output)
         self.extra_env = dict(extra_env or {})
 
-    async def run(self, root: str | Path, command: str, shell: str = "auto", stdin: str | None = None) -> dict:
+    def _call_timeout(self, timeout: float | int | None) -> float:
+        """Resolve one call's timeout: per-call value clamped to a sane range,
+        the runner default when the caller (tests, hosts) passes none."""
+        if timeout is None:
+            return self.timeout
+        try:
+            value = float(timeout)
+        except (TypeError, ValueError):
+            return self.timeout
+        return min(max(value, 1.0), _MAX_CALL_TIMEOUT)
+
+    async def run(self, root: str | Path, command: str, shell: str = "auto",
+                  stdin: str | None = None, timeout: float | None = None) -> dict:
+        call_timeout = self._call_timeout(timeout)
         if not command.strip():
             return {"stdout": "", "stderr": "命令不能为空。", "exit_code": -1,
                     "duration": 0.0, "timed_out": False}
@@ -221,13 +391,14 @@ class CommandRunner:
             return {"stdout": "", "stderr": f"命令启动失败：{exc}", "exit_code": -1,
                     "duration": round(time.monotonic() - started, 3), "timed_out": False}
 
-        stdout_task = asyncio.create_task(_read_capped(proc.stdout, self.max_output))
-        stderr_task = asyncio.create_task(_read_capped(proc.stderr, self.max_output))
+        fallback = _fallback_encoding()
+        stdout_task = asyncio.create_task(_read_capped(proc.stdout, self.max_output, fallback))
+        stderr_task = asyncio.create_task(_read_capped(proc.stderr, self.max_output, fallback))
         input_task = asyncio.create_task(_write_stdin(proc.stdin, stdin))
         wait_task = asyncio.create_task(proc.wait())
         timed_out = False
         try:
-            await asyncio.wait_for(asyncio.shield(wait_task), self.timeout)
+            await asyncio.wait_for(asyncio.shield(wait_task), call_timeout)
         except asyncio.TimeoutError:
             timed_out = True
             await _stop_process(proc)
@@ -253,7 +424,7 @@ class CommandRunner:
             stderr_task.cancel()
             stdout, stderr = "", ""
         if timed_out:
-            stderr = (stderr + "\n" if stderr else "") + f"[执行超时（{self.timeout:g}s 已终止）]"
+            stderr = (stderr + "\n" if stderr else "") + f"[执行超时（{call_timeout:g}s 已终止）]"
         return {
             "stdout": stdout,
             "stderr": stderr,
@@ -466,7 +637,9 @@ def register_command_tools(
         if not command.strip():
             return ToolResult(False, "缺少 command", "run_command 需要非空 command。")
         shell = args.get("shell") or "auto"
-        result = await command_runner.run(workspace_for(ctx), command, shell, args.get("stdin"))
+        result = await command_runner.run(
+            workspace_for(ctx), command, shell, args.get("stdin"),
+            timeout=args.get("timeout"))
         parts = []
         if result["stdout"].strip():
             parts.append(result["stdout"].rstrip())
@@ -483,28 +656,46 @@ def register_command_tools(
             content,
         )
 
+    description = (
+        "在主机上执行工作区目录下的系统 shell 命令。auto 在 Linux/macOS 使用 bash（缺少时用 sh），"
+        "在 Windows 使用 PowerShell（缺少时用 cmd）；也可指定 bash（仅 Windows 侧的 Git-Bash / POSIX 主机）、"
+        "sh、powershell、cmd，或 wsl（仅在 Windows 宿主可用：命令在 Linux 子系统中执行，"
+        "路径与解释器和 Windows 侧不同）。命令拥有当前用户的主机权限，可访问工作区以外的文件和网络，"
+        "副作用不可撤销；仅在用户明确启用此能力后调用。"
+        "危险命令有防线：毁灭性操作（如 rm -rf /、mkfs、format 盘符）会被直接拒绝；"
+        "破坏性但可控的操作（如 rm -r 指定目录、git push --force、sudo）需要用户审批，"
+        "被拒后不要原样重试。\n"
+        + _host_shell_note()
+    )
+
     registry.register(
         ToolSpec(
             "run_command",
-            "在主机上执行工作区目录下的系统 shell 命令。auto 在 Linux/macOS 使用 bash（缺少时用 sh），在 Windows 使用 PowerShell（缺少时用 cmd）；也可指定 bash、sh、powershell 或 cmd。命令拥有当前用户的主机权限，可访问工作区以外的文件和网络，副作用不可撤销；仅在用户明确启用此能力后调用。"
-            "危险命令有防线：毁灭性操作（如 rm -rf /、mkfs、format 盘符）会被直接拒绝；"
-            "破坏性但可控的操作（如 rm -r 指定目录、git push --force、sudo）需要用户审批，"
-            "被拒后不要原样重试。",
+            description,
             {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "要执行的系统命令"},
                     "shell": {
                         "type": "string",
-                        "enum": ["auto", "bash", "sh", "powershell", "cmd"],
+                        "enum": ["auto", "bash", "sh", "powershell", "cmd", "wsl"],
                         "description": "shell 类型，省略时按当前操作系统自动选择",
                     },
                     "stdin": {"type": "string", "description": "可选标准输入"},
+                    "timeout": {
+                        "type": "number",
+                        "description": (
+                            "可选执行超时（秒），范围 1-1800，默认 300。"
+                            "pip install、构建、测试等长命令请显式给较大值，"
+                            "超时后命令被终止并返回已产生的输出"),
+                    },
                 },
                 "required": ["command"],
             },
             ToolCategory.WRITE,
-            timeout=command_runner.timeout + 10,
+            # Above the per-call maximum so the runner's internal timeout
+            # (which preserves partial output) always fires first.
+            timeout=_MAX_CALL_TIMEOUT + 15,
         ),
         run_command,
     )

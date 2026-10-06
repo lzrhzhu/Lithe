@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.1.6 (2026-10-06)
+
+The shell-reliability round, from a usage audit: of 225 real `run_command`
+calls in the wild, 83 (36.9%) failed — versus 0.5% for `read_file`. Dispatch
+and argument validation were blameless; every dominant failure class lived in
+`lithe.bundles.command`'s execution layer. Half of it was one silent trap:
+`shell="bash"` on Windows resolved `shutil.which("bash")` to WSL's
+`System32\bash.exe`, so POSIX-dialect commands ran inside the Linux subsystem
+— a different OS with its own interpreters, PATH and filesystem view
+(`python: command not found`, venvs dying on `/mnt` drvfs, installs landing in
+the wrong world).
+
+- **`bash` on Windows no longer means WSL** — `_windows_bash` excludes the
+  WSL stub and resolves Git for Windows (`%ProgramFiles%\Git\bin\bash.exe`),
+  the only bash sharing this OS's filesystem and interpreters. No Windows-side
+  bash at all: the call fails loudly with rewrite guidance (use PowerShell
+  syntax, or the new explicit `wsl`) instead of silently switching OS or
+  dialect. `wsl` is now a first-class, Windows-only `shell` enum value:
+  cross-boundary execution must be a choice, never a fallback.
+- **the tool description states the host platform** — `_host_shell_note`,
+  resolved at registration from what is actually installed: auto's real
+  target (with the PowerShell 5.1 caveats: no `&&`, no `VAR=x cmd`, no POSIX
+  utils), the machine's actual shell inventory, and the no-bash guidance.
+  The model stops guessing the OS; observed dialect failures (`cd x && … |
+  tail`, `if [ -x … ]`) were largely invitations from a platform-blind
+  description.
+- **the child env no longer breaks real tooling** — `_WINDOWS_ENV` forwards
+  `SYSTEMDRIVE`/`OS`/`USERNAME`/`USERDOMAIN`/`COMPUTERNAME`/`PSMODULEPATH`
+  (ACL checks in pytest runs of this very project died on the missing account
+  vars; the missing `PSModulePath` made every PowerShell spawn rescan modules
+  and emit `#< CLIXML` stderr noise). The sandbox bundle's Windows allowlist
+  gains the account vars too. Children get `PYTHONUTF8=1` /
+  `PYTHONIOENCODING=utf-8` injected (overridable via `extra_env`), aligned
+  with the sandbox bundle.
+- **mojibake fixed at the decode boundary** — `_read_capped` buffers bytes
+  (bounded head+tail windows) and decodes UTF-8-first with a
+  `locale.getpreferredencoding` fallback on Windows, replacing the hard-wired
+  incremental UTF-8 decoder that turned GBK child output into `δ??װ Numba`.
+- **per-call timeout** — `run_command` accepts `timeout` (1–1800s, default
+  raised 120→300s): `pip install` / venv creation no longer die at exactly
+  120s mid-download; the registry-level ToolSpec timeout sits above the cap
+  so the runner's output-preserving kill always fires before asyncio's hard
+  cancellation. PowerShell preamble sets `$ProgressPreference =
+  'SilentlyContinue'` to suppress serialized progress records in stderr.
+
+
 ## 0.1.5 (2026-10-06)
 
 - Persist subagent lifecycle records with task metadata, display name, terminal status, step count, and change count for history consumers.

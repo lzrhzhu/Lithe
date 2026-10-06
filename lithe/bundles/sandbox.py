@@ -35,11 +35,12 @@ _SAFE_ENV_NAMES = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM")
 # required to initialize hash randomization (CryptoAPI lives under it) — a
 # Python started without it dies with "_Py_HashRandomization_Init" before
 # running any code. TEMP/TMP back tempfile, COMSPEC/PATHEXT back subprocess
-# spawning. None of these carry secrets.
+# spawning. USERNAME/USERDOMAIN/COMPUTERNAME back account lookups (icacls /
+# ACL checks in the code under test). None of these carry secrets.
 _WIN_SAFE_ENV_NAMES = (
     "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE",
     "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "OS", "NUMBER_OF_PROCESSORS",
-    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_ARCHITECTURE", "USERNAME", "USERDOMAIN", "COMPUTERNAME",
 )
 
 
@@ -50,7 +51,7 @@ def _sandbox_env(*, windows: bool | None = None) -> dict[str, str]:
     is_windows = os.name == "nt" if windows is None else windows
     env = {"HOME": "/tmp", "MPLBACKEND": "Agg", "XDG_CACHE_HOME": "/tmp/.cache",
             "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
-            "PYTHONIOENCODING": "utf-8"}
+            "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 
     names = _SAFE_ENV_NAMES + (_WIN_SAFE_ENV_NAMES if is_windows else ())
     for name in names:
