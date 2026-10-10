@@ -13,7 +13,8 @@ What a preset deliberately does and does not carry:
 - ``base_url`` — the vendor's usual chat-completions root (the kernel
   appends ``/chat/completions``; ``responses`` presets carry the full
   endpoint URL instead, matching ``ResponsesTransport``).
-- ``transport`` — usually ``"chat"``; a ``"responses"`` preset names it.
+- ``transport`` — usually ``"chat"``; presets on other protocols
+  (``"responses"`` / ``"messages"``) name it.
 - ``document_format`` — the document-content-block *dialect* the endpoint
   family accepts (see :mod:`lithe.bundles.documents`): ``"inline-file"``
   (OpenRouter family, incl. self-built routers speaking its format behind
@@ -55,6 +56,18 @@ PRESETS: dict[str, dict[str, Any]] = {
                  "（top_p/seed/response_format 等）。推理模型可改用 responses "
                  "transport（base_url 需为完整 /responses 端点 URL）。文档输入走"
                  "files-api 两步上传（先 POST /files 拿 file_id 再引用块）。",
+    },
+    "anthropic": {
+        "base_url": "https://api.anthropic.com/v1",
+        "transport": "messages",
+        "document_format": "none",
+        "notes": "Anthropic 官方端点，messages transport（内核拼接 /messages，"
+                 "x-api-key 认证）。max_tokens 协议必填：未设置时内核默认 4096。"
+                 "推理强度 reasoning_effort 映射为思考预算（low/medium/high → "
+                 "2k/8k/16k，minimal 不开启）；需精确预算经 extra_body 设 thinking "
+                 "对象（与 reasoning_effort 二选一）。开启思考时 temperature 自动"
+                 "省略。Bedrock/Vertex 网关或自建代理改 base_url 即可。图像输入"
+                 "支持 data:/https: URL。",
     },
     "zai": {
         "base_url": "https://open.bigmodel.cn/api/paas/v4",

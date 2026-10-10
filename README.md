@@ -32,10 +32,10 @@ stream, undo, and delegation.
   tagged so undo still reverts their work, fan out in parallel with
   per-delegation budgets, and fold their spend back into the parent run's
   stats.
-- **Any OpenAI-compatible endpoint.** Chat-completions and Responses
-  protocols behind one interface, with retries, jittered backoff,
-  `Retry-After`-aware 429 handling, and SSE streaming; usage is
-  normalized to one shape across both.
+- **Any OpenAI-compatible — or Anthropic Messages — endpoint.**
+  Chat-completions, Responses, and Messages protocols behind one interface,
+  with retries, jittered backoff, `Retry-After`-aware 429 handling, and SSE
+  streaming; usage is normalized to one shape across all three.
 
 ## Install
 
@@ -81,7 +81,7 @@ store backend — the engine, persistence, run envelope, undo, and (via
 | --- | --- |
 | `runtime` | `AgentRuntime`, the ReAct loop as an async event stream: streaming deltas; cancellation checked between deltas; run budgets (`max_cost` / `max_total_tokens`) ending with `status="budget_exceeded"` (cost computed from `LLMConfig.pricing` when the gateway reports none; parallel delegations count their in-flight siblings' live spend against the same ceiling); a repeat-call nudge for stuck models (reset by intervening writes, so read-after-write cycles are never flagged); a forced toolless wrap-up when the step budget is hit; mid-run context trimming that escalates from shrinking old tool outputs to dropping whole old exchanges under an omission note; a steering inbox (`inbox=` queue of user texts injected at step boundaries); error-isolated sinks; an injectable `http_client` for connection pooling (a client still on httpx's 5s default is upgraded to `cfg.timeout` instead of silently failing long calls). Every event is stamped with `run_id` + a monotonic `seq`; runs report wall-clock `duration_s`, tool results carry `elapsed_ms`, and streaming calls report time-to-first-token. |
 | `llm` | OpenAI-compatible client: retry with jittered backoff, `Retry-After`-aware 429 handling, fail-fast on fatal 4xx, response-shape validation, and SSE streaming helpers. |
-| `transports` | Chat-completions and Responses transports with usage normalized to `prompt_tokens` / `completion_tokens` / `total_tokens`; reasoning items replayed within the tool loop where the protocol supports it; `image_url` blocks mapped to `input_image` on the Responses path (unmappable blocks raise instead of vanishing). `LLMConfig.extra_body` / `default_headers` carry vendor fields and gateway headers on every call; `LLMConfig.reasoning_effort` maps to `reasoning_effort` (chat) / `reasoning.effort` (Responses), deep-merged with `extra_body["reasoning"]` siblings. |
+| `transports` | Chat-completions, Responses, and Messages (Anthropic) transports with usage normalized to `prompt_tokens` / `completion_tokens` / `total_tokens`; reasoning items replayed within the tool loop where the protocol supports it (Responses reasoning items; Messages thinking blocks, verbatim with signatures); `image_url` blocks mapped to `input_image` (Responses) / base64-or-url `source` (Messages) — unmappable blocks raise instead of vanishing. `LLMConfig.extra_body` / `default_headers` carry vendor fields and gateway headers on every call; `LLMConfig.reasoning_effort` maps to `reasoning_effort` (chat) / `reasoning.effort` (Responses) / thinking budgets (Messages, with the temperature/max_tokens shims the protocol requires), deep-merged with `extra_body` siblings. |
 | `tools` | `ToolRegistry`: register / unregister / dispatch, READ/WRITE/META category filtering, argument validation (required + top-level types + enums), pre-validation argument **transforms** (path canonicalization, defaults, redaction), per-tool timeouts, and pre-dispatch **middleware** for audit, quota, or human-in-the-loop confirmation of write tools. |
 | `actions` | `Action` + `UndoEngine`: pure, storage-free undo; reverters may be sync or async. |
 | `memory` | `replay_messages` / `recap_text` / `window_with_recap` / `run_timeline` + the `MemoryProvider` protocol; two-sided, window-safe replay reconciliation drops orphaned tool rows instead of sending API-rejected payloads. |
@@ -97,7 +97,7 @@ store backend — the engine, persistence, run envelope, undo, and (via
 | `subagents` | `SubagentEngine` + `delegate` / `delegate_parallel` tools: isolated worker agents the orchestrator hands subtasks to — tagged for undo, bounded by `max_parallel`, per-delegation budgets, cancellation propagated from the parent run, live `subagent_progress` heartbeats. |
 | `admin` | Admin-panel tools: `tool_categories`, `list_tools_admin`, `list_tool_packages_admin`, `check_packages`. |
 | `patch` | `apply_patch`: line-oriented multi-file edits via the Codex `*** Begin Patch` envelope, a four-pass fuzzy matcher, and all-or-nothing application against an in-memory overlay. |
-| `providers` | Vendor presets: known-good `LLMConfig` fields per OpenAI-compatible endpoint (openai / zai / deepseek / openrouter / qwen / moonshot) as plain data — `get_preset` / `apply_preset` merge a preset under host overrides (dict fields per key). Defaults, never truth: credentials and model always come from the caller, model-specific switches stay in `notes`. Each preset also names the family's `document_format` dialect (see the `documents` bundle). |
+| `providers` | Vendor presets: known-good `LLMConfig` fields per endpoint (openai / anthropic / zai / deepseek / openrouter / qwen / moonshot) as plain data — `get_preset` / `apply_preset` merge a preset under host overrides (dict fields per key). Defaults, never truth: credentials and model always come from the caller, model-specific switches stay in `notes`. Each preset names its protocol's `transport` (`chat` / `responses` / `messages`) and the family's `document_format` dialect (see the `documents` bundle). |
 | `workspace` | Sandboxed file I/O: `read_file` / `write_file` / `edit_file` / `list_files` / `search_files` / `glob_files` with undo reverters, a stale-file guard that refuses to clobber externally changed files, and symlink-safe directory walks. |
 | `todos` | A per-scope task list the agent plans against: `TodoStore` + atomic JSON persistence + `update_todos` / `list_todos` tools + a `todos_block` for the system prompt. |
 | `images` | `image_info` (a stdlib-only header probe: dimensions, dpi, color mode) and `analyze_image` (one vision-model call, memoized per file hash + question) — image answers never enter the main conversation. |

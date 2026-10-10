@@ -92,9 +92,10 @@ def _parse_reasoning(raw: Any) -> list[dict] | None:
 
     Hosts may persist them as a JSON string (one column) or as a parsed list;
     anything malformed degrades to ``None`` — a replay without reasoning is
-    valid, just chain-less. Non-dict entries and non-reasoning items are
-    dropped so a corrupted row cannot smuggle arbitrary input items into the
-    next request.
+    valid, just chain-less. Non-dict entries are dropped, and only known
+    reasoning item shapes survive (Responses ``reasoning`` items; Messages
+    ``thinking`` / ``redacted_thinking`` blocks) so a corrupted row cannot
+    smuggle arbitrary input items into the next request.
     """
     if not raw:
         return None
@@ -106,7 +107,8 @@ def _parse_reasoning(raw: Any) -> list[dict] | None:
     if not isinstance(raw, list):
         return None
     items = [r for r in raw
-             if isinstance(r, dict) and r.get("type") == "reasoning"]
+             if isinstance(r, dict)
+             and r.get("type") in ("reasoning", "thinking", "redacted_thinking")]
     return items or None
 
 
@@ -116,6 +118,9 @@ def reasoning_summary_text(reasoning: list[dict] | None) -> str:
     OpenAI-shaped items carry ``summary`` as a list of ``{type:
     summary_text, text}`` blocks; some gateways send a plain string. The
     encrypted chain itself is opaque — only this digest is displayable.
+    Messages-protocol ``thinking`` blocks carry the chain as plain text
+    under ``thinking`` (``redacted_thinking`` stays opaque); that text is
+    displayable too.
     """
     parts: list[str] = []
     for item in reasoning or []:
@@ -129,6 +134,9 @@ def reasoning_summary_text(reasoning: list[dict] | None) -> str:
             for s in summary:
                 if isinstance(s, dict) and (s.get("text") or "").strip():
                     parts.append(s["text"].strip())
+        text = item.get("thinking")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
     return "\n".join(parts)
 
 

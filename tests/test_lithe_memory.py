@@ -91,6 +91,25 @@ def test_replay_rehydrates_reasoning():
     assert reasoning_summary_text(None) == ""
 
 
+def test_replay_rehydrates_thinking_blocks():
+    """Messages 协议的 thinking 块与 Responses 的 reasoning 项同一通道：
+    回放校验放行，摘要可读（redacted 不可读但不报错）。"""
+    think = {"type": "thinking", "thinking": "先查配置", "signature": "sig"}
+    redacted = {"type": "redacted_thinking", "data": "…"}
+    rows = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "",
+         "tool_calls": json.dumps(
+             [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]),
+         "reasoning": json.dumps([think, redacted])},
+        {"role": "tool", "tool_call_id": "c1", "content": "r"},
+    ]
+    out = replay_messages(rows)
+    assert out[1]["reasoning"] == [think, redacted]
+    from lithe.memory import reasoning_summary_text
+    assert reasoning_summary_text([think, redacted]) == "先查配置"
+
+
 def test_replay_orphan_tool_call_falls_back_to_text():
     # assistant tool_calls with no matching tool result → tool_calls dropped,
     # text content kept (so the turn isn't lost entirely)

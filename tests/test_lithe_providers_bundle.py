@@ -11,8 +11,8 @@ from lithe.bundles.providers import (
 
 def test_known_providers_cover_documented_set():
     names = known_providers()
-    for expected in ("openai", "zai", "deepseek", "openrouter", "qwen",
-                     "moonshot"):
+    for expected in ("openai", "anthropic", "zai", "deepseek", "openrouter",
+                     "qwen", "moonshot"):
         assert expected in names
     assert names == sorted(names)
 
@@ -22,6 +22,18 @@ def test_get_preset_returns_config_keys_only():
     assert preset["base_url"].startswith("https://")
     assert preset["transport"] == "chat"
     assert "notes" not in preset, "notes 是给人看的，不进 LLMConfig"
+
+
+def test_anthropic_preset_selects_messages_transport():
+    """厂商→协议映射只发生在 preset 的 transport 字段：anthropic 厂商
+    用 messages 协议，档案里选了它 LLMConfig 就直接可跑。"""
+    kwargs = apply_preset("anthropic", model="claude-x", api_key="sk-x")
+    assert kwargs["base_url"] == "https://api.anthropic.com/v1"
+    assert kwargs["transport"] == "messages"
+    from lithe import LLMConfig
+    from lithe.transports import MessagesTransport, make_transport
+    cfg = LLMConfig(**kwargs)
+    assert isinstance(make_transport(cfg.transport), MessagesTransport)
 
 
 def test_get_preset_unknown_raises_with_known_list():

@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.9 (2026-10-10)
+
+The third-protocol round: Anthropic Messages joins chat-completions and
+Responses behind the same `LLMTransport` interface. The runtime stays
+protocol-agnostic — the whole change is one transport, one preset, and the
+thinking-block replay path.
+
+- **`MessagesTransport` (`transport="messages"`)** — the Anthropic Messages
+  API: chat `messages` become `(system, turns)` with `tool_use` /
+  `tool_result` content blocks (consecutive same-role turns merge, parallel
+  tool results batch into the following user turn); `content[]` parses back
+  into the unified `{content, tool_calls, usage, finish_reason}` shape
+  (`tool_use.input` dicts re-serialized to chat-style JSON-string
+  arguments; `stop_reason` mapped onto the chat vocabulary). Auth is the
+  protocol's own `x-api-key` + `anthropic-version` headers — no bearer
+  token. `base_url` is the API root (`/messages` appended, matching the
+  chat convention). Streaming parses the `content_block_delta` event
+  family (text deltas delivered live; `input_json_delta` fragments joined;
+  `message_start`/`message_delta` usage merged).
+- **protocol shims, not vendor knowledge** — `max_tokens` is required by
+  the protocol and defaulted (4096) when unset; `reasoning_effort` maps
+  onto thinking budgets (low/medium/high → 2k/8k/16k, minimal enables
+  nothing) with the two constraints the protocol imposes fixed up after
+  the extra_body merge: `temperature` dropped while thinking is enabled,
+  and `max_tokens` raised to budget + 4096 when it would not exceed the
+  budget. A host wanting an exact budget sets `extra_body["thinking"]`
+  instead of the effort knob — the merge makes the two exclusive.
+- **thinking replay** — `thinking` / `redacted_thinking` blocks are
+  captured as `reasoning` items and re-emitted verbatim (signature intact)
+  within the active tool loop, same `reasoning_scope` semantics as the
+  Responses transport; memory replay validation and the display digest
+  accept the Messages shapes. A 400 that clears after dropping thinking
+  input degrades for that one call — availability over continuity, the
+  same cascade pattern as before.
+- **`anthropic` provider preset** — the only place the vendor enters:
+  `base_url` + `transport="messages"` + `document_format="none"` as plain
+  data under host overrides; the CLI needed zero changes (its `"chat"`
+  default deliberately never clobbers a preset that knows better).
+
 ## 0.1.8 (2026-10-06)
 
 edit_file switches to strict exact matching (the Kilo discipline). The

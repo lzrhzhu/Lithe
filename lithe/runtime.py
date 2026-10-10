@@ -91,8 +91,9 @@ class LLMConfig:
     """Endpoint + retry policy for the runtime's model calls.
 
     ``transport`` selects the wire protocol: ``"chat"`` (OpenAI
-    chat-completions, default) or ``"responses"`` (OpenAI Responses API).
-    A host may also pass a custom :class:`~lithe.transports.LLMTransport`
+    chat-completions, default), ``"responses"`` (OpenAI Responses API) or
+    ``"messages"`` (Anthropic Messages API). A host may also pass a custom
+    :class:`~lithe.transports.LLMTransport`
     instance. ``stream=True`` asks a streaming-capable transport for token
     deltas (the runtime then emits ``assistant_delta`` events ahead of the
     final ``assistant`` one; unsupported transports fall back silently).
@@ -102,8 +103,8 @@ class LLMConfig:
     conversation is. ``temperature`` / ``max_tokens`` are plain sampling
     parameters forwarded on every model call (``None`` leaves them unset).
     ``reasoning_replay`` (default True) asks a reasoning-capable transport to
-    pass reasoning items back (Responses protocol); set False for gateways
-    that reject reasoning input items. ``reasoning_scope`` selects which turns
+    pass reasoning items back (Responses / Messages protocols); set False
+    for gateways that reject reasoning input items. ``reasoning_scope`` selects which turns
     replay their reasoning: ``"loop"`` (default) scopes pass-back to the
     active tool loop (vendor's cost guidance — dropped once a new user
     message arrives); ``"conversation"`` replays every turn's reasoning,
@@ -136,10 +137,12 @@ class LLMConfig:
     sends it as OpenAI-style top-level ``reasoning_effort``, the Responses
     transport as ``reasoning: {"effort": ...}``, deep-merged with any
     ``extra_body["reasoning"]`` keys (internal wins per key, so a host can
-    still add ``max_tokens``/``exclude`` alongside). ``None`` sends
-    nothing. Which values a model actually accepts is the endpoint's call —
-    an unsupported value surfaces through the 400 diagnostics instead of
-    silent mangling.
+    still add ``max_tokens``/``exclude`` alongside); the Messages transport
+    maps levels onto thinking budgets (low/medium/high → 2k/8k/16k, with
+    the ``temperature``/``max_tokens`` shims the protocol requires). ``None``
+    sends nothing. Which values a model actually accepts is the endpoint's
+    call — an unsupported value surfaces through the 400 diagnostics instead
+    of silent mangling.
 
     ``document_format`` is the document-content-block dialect this endpoint
     family accepts (``"inline-file"`` / ``"files-api"`` / ``"none"`` —
