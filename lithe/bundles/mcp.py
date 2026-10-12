@@ -248,18 +248,26 @@ class _StdioSession:
 
     async def start(self) -> None:
         env = self._spawn_env()
-        process_options = (
-            {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
-            if os.name == "nt"
-            else {"start_new_session": True}
-        )
-        self.proc = await asyncio.create_subprocess_exec(
-            *self.cfg.command, env=env, cwd=self.cfg.cwd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **process_options,
-        )
+        argv = self.cfg.command
+        if not argv:
+            raise RuntimeError(
+                f"MCP 服务器 {self.cfg.name} 缺少 command（stdio 传输必填）")
+        if os.name == "nt":
+            self.proc = await asyncio.create_subprocess_exec(
+                *argv, env=env, cwd=self.cfg.cwd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+        else:
+            self.proc = await asyncio.create_subprocess_exec(
+                *argv, env=env, cwd=self.cfg.cwd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
         self._reader = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         try:
@@ -371,7 +379,7 @@ class _StdioSession:
 
     async def _notify(self, method: str, params: dict | None = None) -> None:
         assert self.proc and self.proc.stdin
-        payload = {"jsonrpc": "2.0", "method": method}
+        payload: dict = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             payload["params"] = params
         self.proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
@@ -379,18 +387,20 @@ class _StdioSession:
 
     async def _request(self, method: str, params: dict | None = None,
                        *, timeout: float) -> dict:
-        if (not self.proc or self.proc.stdin.is_closing()
+        proc = self.proc
+        stdin = proc.stdin if proc is not None else None
+        if (stdin is None or stdin.is_closing()
                 or not self.alive and method != "initialize"):
             raise RuntimeError(f"MCP 服务器 {self.cfg.name} 未连接")
         self._next_id += 1
         req_id = self._next_id
-        payload = {"jsonrpc": "2.0", "id": req_id, "method": method}
+        payload: dict = {"jsonrpc": "2.0", "id": req_id, "method": method}
         if params is not None:
             payload["params"] = params
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
-        self.proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
-        await self.proc.stdin.drain()
+        stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+        await stdin.drain()
         try:
             msg = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
@@ -465,9 +475,16 @@ class _StdioSession:
                 except (OSError, asyncio.TimeoutError):
                     pass
         else:
+            # POSIX-only APIs; resolved dynamically so the Windows typeshed
+            # still type-checks this module (this branch is POSIX-only).
+            killpg = getattr(os, "killpg", None)
+            getpgid = getattr(os, "getpgid", None)
+            sigkill = getattr(signal, "SIGKILL", None)
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                return
+                if killpg is not None and getpgid is not None \
+                        and sigkill is not None:
+                    killpg(getpgid(proc.pid), sigkill)
+                    return
             except (ProcessLookupError, PermissionError, OSError):
                 pass
         try:
@@ -545,7 +562,7 @@ class _HTTPSession:
         return self._decode_response(resp, method, req_id)
 
     async def _notify(self, method: str, params: dict | None = None) -> None:
-        payload = {"jsonrpc": "2.0", "method": method}
+        payload: dict = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             payload["params"] = params
         try:

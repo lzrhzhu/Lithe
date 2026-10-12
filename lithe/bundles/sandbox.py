@@ -100,8 +100,14 @@ async def _kill_tree(proc) -> None:
             except ProcessLookupError:
                 pass
         return
+    # os.killpg/getpgid/SIGKILL are POSIX-only (Windows returns above);
+    # resolved dynamically so this module type-checks on a Windows typeshed.
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    sigkill = getattr(signal, "SIGKILL", None)
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        if killpg is not None and getpgid is not None and sigkill is not None:
+            killpg(getpgid(proc.pid), sigkill)
     except (ProcessLookupError, PermissionError, OSError):
         if proc.returncode is None:
             try:

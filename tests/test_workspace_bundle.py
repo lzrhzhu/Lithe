@@ -757,3 +757,59 @@ async def test_walk_and_search_skip_symlinks(tmp_path):
     # direct read of a symlinked path is still refused by safe_path
     res = await reg.dispatch("read_file", {"path": "leak.txt"}, ctx)
     assert res.ok is False
+
+
+def _ctx():
+    return AgentContext(run_id="r", user_id="u")
+
+
+# --------------------------------------------------------------------------- #
+# workspace: edit_file trailing blanks / search hardening / list subdirs
+# --------------------------------------------------------------------------- #
+
+def _ws_reg(tmp_path):
+    from lithe.bundles.workspace import Workspace, register_file_tools
+    ws = Workspace(tmp_path)
+    reg = ToolRegistry()
+    register_file_tools(reg, lambda ctx: ws)
+    return ws, reg
+
+
+async def test_edit_file_strict_trailing_blank_alignment(tmp_path):
+    """严格匹配下，行尾空白使精确子串 "a\n" 无法命中——硬错误而非模糊对齐；
+    按实际内容（含行尾空白）重试后精确落地，也不会多插空行。"""
+    ws, reg = _ws_reg(tmp_path)
+    ws.write("f.txt", "a  \nb\n")  # 行尾空白使精确子串 "a\n" 无法命中
+    res = await reg.dispatch("edit_file", {
+        "path": "f.txt", "old_text": "a\n", "new_text": "X\n"}, _ctx())
+    assert res.ok is False and "未找到 old_text" in res.content
+    assert ws.read("f.txt") == "a  \nb\n"
+    exact = await reg.dispatch("edit_file", {
+        "path": "f.txt", "old_text": "a  \n", "new_text": "X\n"}, _ctx())
+    assert exact.ok, exact.content
+    assert ws.read("f.txt") == "X\nb\n"
+
+
+async def test_search_files_skips_overlong_lines(tmp_path):
+    ws, reg = _ws_reg(tmp_path)
+    ws.write("big.txt", "needle" + "x" * 20000 + "\n")  # needle 在超长行上
+    ws.write("small.txt", "needle here\n")
+    res = await reg.dispatch("search_files", {"pattern": "needle"}, _ctx())
+    assert res.ok
+    assert "small.txt:1" in res.content
+    assert "big.txt:1" not in res.content, "超长行必须跳过"
+    assert "超长行" in res.content
+
+
+def test_search_files_has_timeout_spec(tmp_path):
+    _, reg = _ws_reg(tmp_path)
+    assert reg.spec("search_files").timeout == 30.0
+
+
+def test_workspace_list_subdirs_go_through_guard(tmp_path):
+    from lithe.bundles.workspace import Workspace
+    ws = Workspace(tmp_path)
+    outside = tmp_path.parent / "outside-target"
+    outside.mkdir(exist_ok=True)
+    with pytest.raises(PermissionError):
+        ws.list(("../outside-target",))

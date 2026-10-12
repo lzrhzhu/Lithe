@@ -46,7 +46,8 @@ import httpx
 from lithe import __version__
 from lithe.context import AgentContext
 from lithe.tools import ToolCategory, ToolRegistry, ToolResult, ToolSpec
-from lithe.bundles.workspace import Workspace, _check_run_growth, _note_created
+from lithe.bundles._revisions import _check_run_growth, _note_created
+from lithe.bundles.workspace import Workspace
 
 DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_TIMEOUT = 120.0

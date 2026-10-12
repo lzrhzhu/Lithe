@@ -8,11 +8,15 @@ delta (echoed on the usage event).
 from __future__ import annotations
 
 import asyncio
+import json
 
 from lithe import (
     AgentContext, AgentRuntime, LLMConfig, RunStats, ToolRegistry,
     ToolResult, ToolSpec,
 )
+from lithe.events import to_sse
+
+from _fakes import FakeTransport, resp
 
 
 def _resp(content="", tool_calls=None):
@@ -125,3 +129,30 @@ async def test_non_streaming_usage_ttft_is_none():
                                      [{"role": "user", "content": "q"}], [])]
     usage = [e for e in events if e["type"] == "usage"]
     assert usage[0]["ttft_ms"] is None
+
+
+async def test_runtime_envelope_events_when_enabled():
+    rt = _runtime(FakeTransport([resp("done")]), emit_envelope=True)
+    events = [e async for e in rt.run(_ctx(),
+                                      [{"role": "user", "content": "hi"}], [])]
+    assert events[0]["type"] == "run_start"
+    assert events[-1]["type"] == "done"
+    assert events[-1]["status"] == "done"
+    assert events[-1]["steps"] == 1
+
+
+async def test_runtime_no_envelope_by_default():
+    rt = _runtime(FakeTransport([resp("done")]))
+    events = [e async for e in rt.run(_ctx(),
+                                      [{"role": "user", "content": "hi"}], [])]
+    assert all(e["type"] not in ("run_start", "done") for e in events)
+
+
+
+
+def test_to_sse_serializes_datetime_via_str():
+    from datetime import datetime
+    line = to_sse({"type": "user", "at": datetime(2026, 1, 1, 12, 0)})
+    assert line.startswith("data: ")
+    payload = json.loads(line[len("data: "):])
+    assert payload["at"] == "2026-01-01 12:00:00"

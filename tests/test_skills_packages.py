@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+import httpx
+
 from lithe import AgentContext, ToolRegistry
 from lithe.bundles import SKILL_MAIN, RemoteSkillSource, SkillPackages
 from lithe.bundles.skills import register_skill_tool
@@ -150,3 +152,69 @@ async def test_load_skill_tool_offloads_blocking_refresh(tmp_path):
         assert beats > 5
     finally:
         hb.cancel()
+
+
+# --------------------------------------------------------------------------- #
+# skills: remote refresh cleanup (the deprecated lithe.skills alias was
+# removed in the 0.1.10 reorganization — import from lithe.bundles)
+# --------------------------------------------------------------------------- #
+
+
+def test_remote_refresh_failure_cleans_staging(tmp_path, caplog):
+    from lithe.bundles.skills import RemoteSkillSource
+
+    class _BoomClient:
+        def get(self, url, timeout=None):
+            raise httpx.ConnectError("down")
+
+        def close(self):
+            pass
+
+    src = RemoteSkillSource("http://down.example/", tmp_path / "cache",
+                            ttl=0, client=_BoomClient())
+    with caplog.at_level("DEBUG"):
+        src.refresh()
+    assert not (tmp_path / "cache.staging").exists(), "失败不得遗留 staging"
+    assert not (tmp_path / "cache").exists()
+
+
+def _resp_ok(json_body=None, text=None, url="http://x/"):
+    kw = {"json": json_body} if json_body is not None else {"text": text}
+    return httpx.Response(200, request=httpx.Request("GET", url), **kw)
+
+
+def test_remote_refresh_signature_not_committed_on_failure(tmp_path):
+    from lithe.bundles.skills import RemoteSkillSource
+
+    good = {"skills": [{"name": "a", "package": "p", "version": "1"}]}
+    body = "# skill a\n"
+
+    class _HalfClient:
+        def get(self, url, timeout=None):
+            if "index.json" in url:
+                return _resp_ok(json_body=good, url=url)
+            raise httpx.ConnectError("mid-download failure")
+
+        def close(self):
+            pass
+
+    class _OkClient:
+        def get(self, url, timeout=None):
+            if "index.json" in url:
+                return _resp_ok(json_body=good, url=url)
+            return _resp_ok(text=body, url=url)
+
+        def close(self):
+            pass
+
+    src = RemoteSkillSource("http://x/", tmp_path / "c2", ttl=0,
+                            client=_HalfClient())
+    src.refresh()  # 半途失败：缓存不换，签名不提交
+    assert not (tmp_path / "c2").exists()
+    assert src._index_sig is None
+    # 之后服务器恢复：同一 index 必须仍然触发完整刷新（不得因错误的
+    # 签名提交而短路）
+    src2 = RemoteSkillSource("http://x/", tmp_path / "c3", ttl=0,
+                             client=_OkClient())
+    src2.refresh()
+    assert (tmp_path / "c3" / "p" / "a.md").read_text(encoding="utf-8") == body

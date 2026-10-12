@@ -15,6 +15,19 @@ from lithe.bundles.patch import register_apply_patch_tool
 from lithe.bundles.store import JsonlRunStore
 from lithe.bundles.workspace import Workspace, register_file_tools
 
+from _fakes import FakeTransport, resp, tc
+
+
+def _ctx():
+    return AgentContext(run_id="r", user_id="u")
+
+
+def _ws_reg(tmp_path):
+    ws = Workspace(tmp_path)
+    reg = ToolRegistry()
+    register_file_tools(reg, lambda ctx: ws)
+    return ws, reg
+
 
 def _setup(tmp_path):
     ws = Workspace(tmp_path / "ws")
@@ -227,3 +240,54 @@ async def test_agent_host_default_assembly_persists_actions(tmp_path):
     report = await undo_run(host, "r6", "u1", reverters=reverters)
     assert report.ok and report.reverted == 1
     assert not ws.exists("a.txt")
+
+
+# --------------------------------------------------------------------------- #
+# host: DictToolAdapter / capture_actions
+# --------------------------------------------------------------------------- #
+
+def test_dict_adapter_warns_on_missing_handler(caplog):
+    from lithe.bundles.host import DictToolAdapter
+    async def h(ctx, args):
+        return {"ok": True, "summary": "s"}
+
+    with caplog.at_level("WARNING"):
+        adapter = DictToolAdapter(
+            [{"type": "function", "function": {
+                "name": "typo-tool", "parameters": {}}}],
+            {"real_tool": h})
+    assert "typo-tool" in caplog.text
+    assert adapter.names() == []
+
+
+def test_dict_adapter_reverters_map():
+    from lithe.bundles.host import DictToolAdapter
+
+    async def h(ctx, args):
+        return {"ok": True, "summary": "s"}
+
+    def rev(action, ctx):
+        pass
+
+    adapter = DictToolAdapter(
+        [{"type": "function", "function": {"name": "t", "parameters": {}}}],
+        {"t": h}, reverters={"custom_kind": rev})
+    assert adapter.reverters().get("custom_kind") is rev
+
+
+async def test_host_capture_actions_false(tmp_path):
+    from lithe.bundles import AgentHost, JsonlRunStore
+    ws, reg = _ws_reg(tmp_path)
+    store = JsonlRunStore(tmp_path / "store")
+    host = AgentHost(reg, LLMConfig(model="m", base_url="x", api_key="k",
+                                    transport=FakeTransport([
+                                        resp(tool_calls=[tc(
+                                            "write_file",
+                                            {"path": "f.txt",
+                                             "content": "x"}, "c1")]),
+                                        resp("done")])),
+                     store, capture_actions=False)
+    ctx = _ctx()
+    _ = [e async for e in host.run(ctx, "write it")]
+    assert store.list_actions(ctx.run_id, ctx.user_id) == [], \
+        "capture_actions=False 时 StoreSink 不得再记 file_change 动作行"

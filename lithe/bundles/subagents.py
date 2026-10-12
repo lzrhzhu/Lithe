@@ -49,7 +49,7 @@ _THIN_ARGS_CAP = 500
 
 SkillInjector = Callable[[list[str], AgentContext], str]
 ActionLabeler = Callable[[dict], "str | None"]
-EnabledGate = "bool | Callable[[], bool]"
+EnabledGate = bool | Callable[[], bool]
 # Live progress callback: receives (subagent_ctx, {"type": "subagent_progress",
 # "agent": id, "event": <thin runtime event>}). Wire it to the host's own
 # push channel (websocket / SSE side-band) — tool results only land at the end.

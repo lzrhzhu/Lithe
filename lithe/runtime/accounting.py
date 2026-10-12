@@ -1,5 +1,4 @@
 """Usage normalization and cost accounting helpers for the runtime."""
-
 from __future__ import annotations
 
 

@@ -4,6 +4,9 @@ subagent so the engine's high-water snapshot + summary can be exercised."""
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+
+import pytest
 
 from lithe import (
     AgentContext, EventType, LLMConfig, ToolCategory, ToolRegistry, ToolResult,
@@ -13,6 +16,12 @@ from lithe.bundles import (
     AgentHost, JsonlRunStore, SubagentEngine, SubagentRoster, SubagentSpec,
     make_delegate_tool, register_delegate_tool,
 )
+
+from _fakes import FakeTransport, resp
+
+
+def _ctx():
+    return AgentContext(run_id="r", user_id="u")
 
 
 def _tc(name, args, cid="c1"):
@@ -724,3 +733,68 @@ async def test_delegation_spend_folds_into_done_event(tmp_path):
     assert done["tokens"] == 30 + 150
     # store 行同样落全量
     assert store.get_run("r1", "u1").cost == 0.01
+
+
+# --------------------------------------------------------------------------- #
+# subagents
+# --------------------------------------------------------------------------- #
+
+def test_thin_event_caps_args_and_summary():
+    from lithe.bundles.subagents import _THIN_ARGS_CAP, _thin_event
+    fat = "x" * 5000
+    thin = _thin_event({"type": "tool_call", "id": "c", "name": "write_file",
+                        "args": {"content": fat}})
+    assert len(thin["args"]) <= _THIN_ARGS_CAP + 1
+    thin = _thin_event({"type": "tool_result", "id": "c", "name": "n",
+                        "ok": True, "summary": fat})
+    assert len(thin["summary"]) <= 301
+    thin = _thin_event({"type": "tool_result", "id": "c", "name": "n",
+                        "ok": False, "error": fat})
+    assert len(thin["error"]) <= 301
+
+
+async def test_delegate_parallel_accepts_duplicate_agents(tmp_path):
+    """同一子代理的多项任务不再整批拒绝：按列出顺序串行执行，批次成功。
+    （旧契约是返回"重复子代理"错误，模型被迫合并任务或拆成多次调用。）"""
+    from lithe.bundles import JsonlRunStore, SubagentEngine, SubagentRoster
+    from lithe.bundles.subagents import (SubagentSpec,
+                                            make_parallel_delegate_tool)
+    store = JsonlRunStore(tmp_path)
+    reg = ToolRegistry()
+    host_like = SimpleNamespace(
+        registry=reg,
+        llm_config=LLMConfig(model="m", base_url="x", api_key="k",
+                             transport=FakeTransport([resp("done a"),
+                                                       resp("done b")])),
+        store=store, context_budget=None, strict_records=False,
+        max_cost=None, max_total_tokens=None, repeat_call_limit=None,
+        max_steps=2, http_client=None)
+    engine = SubagentEngine(host_like, SubagentRoster(
+        [SubagentSpec("w", "写者", "写", ["echo"], "p")]))
+    spec, handler = make_parallel_delegate_tool(engine)
+    res = await handler(_ctx(), {"tasks": [
+        {"agent": "w", "task": "a"}, {"agent": "w", "task": "b"}]})
+    assert res.ok
+    assert "重复" not in res.content
+    assert res.content.count("### w（成功）") == 2
+
+
+def test_subagent_engine_roster_is_read_only():
+    from lithe.bundles.subagents import SubagentEngine, SubagentRoster, \
+        SubagentSpec
+    host = SimpleNamespace()
+    engine = SubagentEngine(host, SubagentRoster(
+        [SubagentSpec("a", "A", "d", [], "p")]))
+    assert engine.roster.ids() == ["a"]
+    with pytest.raises(AttributeError):
+        engine.roster = SubagentRoster([SubagentSpec("b", "B", "d", [], "p")])
+
+
+def test_delegate_tool_timeout_wired():
+    from lithe.bundles.subagents import SubagentEngine, SubagentRoster, \
+        SubagentSpec, make_delegate_tool
+    engine = SubagentEngine(SimpleNamespace(),
+                            SubagentRoster([SubagentSpec("a", "A", "d", [],
+                                                         "p")]))
+    spec, _ = make_delegate_tool(engine, timeout=123.0)
+    assert spec.timeout == 123.0

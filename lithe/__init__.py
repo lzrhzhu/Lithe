@@ -7,25 +7,29 @@ DB, a file, or drop) and reads prior turns through an optional memory provider
 (added in a later step).
 
 Layout:
-  - llm        : OpenAI-compatible chat client (retry/backoff/jitter)
+  - wire       : protocol-neutral wire plumbing (retry, Retry-After, headers,
+                 SSE framing, 400 diagnosis) shared by every transport
+  - transports : one LLMTransport per wire protocol (base contract,
+                 openai_chat client+transport, openai_responses, anthropic)
+                 + factory
   - events     : Event vocabulary, EventSink, SSE serialization
   - context    : AgentContext (typed, mapping-compatible)
+  - windowing  : conversation sizing + safe mid-run context compaction
   - modes      : AgentMode / ToolCategory + category filtering
   - actions    : Action model + UndoEngine (pure logic, no storage)
   - tools      : ToolSpec / ToolResult / ToolRegistry (dispatch + undo wiring)
+  - runtime    : the ReAct loop package (loop, config, protocol, accounting)
+  - llm        : deprecated alias over lithe.transports.openai_chat / wire
 """
 # Single source of truth for the package version; pyproject reads it via
 # [tool.setuptools.dynamic] (statically, without importing this module).
-__version__ = "0.1.9"
+__version__ = "0.2.1"
 
 from lithe.actions import (  # noqa: F401
     Action, Reverter, UndoEngine, UndoReport,
 )
 from lithe.context import AgentContext  # noqa: F401
 from lithe.events import Event, EventSink, EventType, to_sse  # noqa: F401
-from lithe.llm import (  # noqa: F401
-    bearer_headers, chat_completion, first_content, strip_think,
-)
 from lithe.memory import (  # noqa: F401
     DEFAULT_REPLAY_LIMIT, DEFAULT_TOOL_RESULT_CAP, MemoryProvider,
     recap_text, replay_messages, reasoning_summary_text, run_timeline,
@@ -45,6 +49,10 @@ from lithe.tools import (  # noqa: F401
 from lithe.transports import (  # noqa: F401
     ChatCompletionsTransport, LLMTransport, ResponsesTransport, make_transport,
 )
+from lithe.transports.openai_chat import (  # noqa: F401
+    chat_completion, first_content, strip_think,
+)
+from lithe.wire import bearer_headers  # noqa: F401
 
 __all__ = [
     "Action", "AgentContext", "AgentMode", "AgentRuntime",

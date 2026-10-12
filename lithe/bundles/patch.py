@@ -42,6 +42,11 @@ from dataclasses import dataclass, field
 
 from lithe.context import AgentContext
 from lithe.tools import ToolCategory, ToolRegistry, ToolResult, ToolSpec
+from lithe.bundles._revisions import (
+    _check_fresh, _check_run_growth, _note_created, _record_revision,
+    _ws_write_lock,
+)
+from lithe.bundles.workspace import _compact_diff, _delta_note, _file_change
 
 _BEGIN = "*** Begin Patch"
 _END = "*** End Patch"
@@ -399,11 +404,6 @@ def register_apply_patch_tool(
     """
 
     async def apply_patch(ctx: AgentContext, args: dict) -> ToolResult:
-        from lithe.bundles.workspace import (
-            _check_fresh, _check_run_growth, _compact_diff, _delta_note,
-            _file_change, _note_created, _record_revision, _ws_write_lock,
-        )
-
         patch_text = args.get("patch_text") or ""
         if not patch_text.strip():
             return ToolResult(False, "缺少 patch_text", "apply_patch 需要 patch_text。")

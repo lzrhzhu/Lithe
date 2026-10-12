@@ -1,5 +1,147 @@
 # Changelog
 
+## 0.2.1 (2026-10-12)
+
+(0.2.0 was retired before announcement — PyPI never reuses a version
+number, so the release lands as 0.2.1.)
+
+- **tests: the suite is reorganized by behavior** — the two grab-bag
+  milestone files (`test_lithe_p1_round.py` / `p2_round.py`, process
+  history, not behavior) are dissolved into the modules they pin; the two
+  1,400+ line monsters (`test_lithe_transports.py` / `test_lithe_runtime.py`)
+  split by protocol and by runtime concern (loop, cancellation, streaming,
+  tool policy, windowing, limits, usage, steering); the `test_lithe_` file
+  prefix (redundant in a standalone repo) is gone and `test_lithe.py`
+  becomes `test_contract.py`. A shared `tests/_fakes.py` now carries the
+  scripted-transport toolbox (`FakeTransport` / `BoomTransport` /
+  `StreamTransport` / `KwTransport` / `Sink`, payload builders, the
+  mocked-httpx SSE helpers) that was previously copy-pasted into five
+  files. Test count is byte-identical before and after (624 passed,
+  1 skipped).
+- **ci: mypy joins ruff + pytest** — the README has claimed "whole
+  codebase is typed" since the first release while nothing checked it.
+  `pyproject.toml` gains a `[tool.mypy]` section (`files = ["lithe"]`,
+  check_untyped_defs, no_implicit_optional, warn_return_any, …) and CI
+  runs it on every matrix cell. Fixing the initial 75 errors surfaced two
+  real defects: `SubagentEngine`'s `EnabledGate` was a *string* (never a
+  usable type alias), and MCP stdio start unpacked `command=None` into
+  `create_subprocess_exec` (now a clear config error). The rest was
+  Optional-narrowing (`assert`/locals after guards), platform-guarded
+  POSIX-only APIs resolved via `getattr`, and annotations on internal
+  fold helpers. `AgentRuntime.run` / `_loop_step` now return
+  `AsyncGenerator` (a subtype of the old `AsyncIterator`) so the
+  `aclosing()` deterministic-close sites type-check.
+- **breaking: `lithe.llm` removed** — the module was demoted to a
+  deprecated warning shim earlier in this cycle (see below) and is now
+  deleted outright. Since this release also drops the stale
+  `lithe.skills` alias, the version leaves the 0.1.x line to mark the
+  removals. Hosts import the chat client from
+  `lithe.transports.openai_chat` (or top-level `lithe`) and the wire
+  plumbing from `lithe.wire`.
+
+- **refactor: `runtime.py` finished as a `runtime/` package** — the
+  half-split trio (`runtime.py` 966 lines + `runtime_helpers.py` +
+  `runtime_accounting.py`, grab-bag names) became four named modules:
+  `config` (`LLMConfig` / `RunStats`), `loop` (`AgentRuntime` and the step
+  machinery), `protocol` (argument parsing, stop-handle adapter, steering
+  drain, assistant normalization), `accounting` (usage coercion, cost
+  computation). Everything the old modules ever exported — including the
+  underscore aliases the tests pin (`_parse_args`, `_normalize_assistant`,
+  `_computed_cost`, …) and incidental namespace attributes (`lithe.runtime.httpx`,
+  `EventType`) — is re-exported from `lithe.runtime`, so no caller changes.
+  `lithe.runtime_helpers` / `lithe.runtime_accounting` are gone (internal,
+  never exported, no importers outside the runtime itself).
+- **refactor: workspace revision bookkeeping extracted to
+  `bundles/_revisions.py`** — the stale-content guard (stat snapshots +
+  per-context write generations), the per-run file-creation brake, and the
+  run-wide write lock moved out of `bundles/workspace.py` (966 → ~640
+  lines) into the internal sibling of `_textmatch`, because three bundles
+  need them: workspace, `patch` (its function-level private import from
+  workspace is hoisted to a clean module-level import), and `download`
+  (which imported `_check_run_growth` / `_note_created` across module
+  boundaries). `workspace` re-exports the moved names, so existing
+  `from lithe.bundles.workspace import _check_fresh` calls keep working.
+  The `Workspace` class, file tools, and diff/UI helpers are untouched.
+- **refactor: `lithe.llm` demoted to a deprecated alias; the chat client
+  lives in `lithe.transports.openai_chat`** — the client
+  (`chat_completion` / `iter_chat_completion` / `first_content` /
+  `strip_think`) moved into the chat protocol's transport module: one
+  protocol, one module, and nothing in the kernel imports `lithe.llm`
+  anymore. The images / documents bundles now make their one-shot
+  perception calls through `ChatCompletionsTransport.complete` (same wire
+  payload, same retry policy — the unified-result mapping replaces
+  `first_content`). Top-level `lithe` exports are unchanged and importing
+  `lithe` stays warning-clean. The stale `lithe.skills` alias (deprecated
+  one cycle earlier) is deleted in this release — import from
+  `lithe.bundles`; `lithe.llm` follows it out (see the breaking note
+  above).
+- **refactor: `transports.py` split into a `transports/` package** — the
+  module had grown to ~2,100 lines holding three wire protocols plus the
+  shared contract. Now one module per protocol (`openai_chat`,
+  `openai_responses`, `anthropic`) over a shared `base` (the `LLMTransport`
+  protocol, `TransportResult`, usage normalization, `_flatten_text`,
+  `_merge_extra`), with `__init__` carrying the factory and the full
+  compatibility surface: every name importable from the old flat module —
+  including the private translation helpers the tests pin
+  (`_messages_to_input`, `_messages_to_anthropic`, `_parse_anthropic`, …) —
+  is still importable from `lithe.transports`. Zero behavior change; the
+  whole suite (kernel + CLI) runs green against the split.
+- **refactor: wire plumbing extracted into `lithe.wire`** — retry policy
+  (retryable statuses, `Retry-After` parsing, equal-jitter backoff),
+  `bearer_headers`, SSE framing (`iter_sse_lines`) and the 400
+  `extra_body` diagnosis moved out of `lithe.llm` into a protocol-neutral
+  module. This inverts a dependency that pointed the wrong way: the
+  transports used to import their plumbing from the legacy chat client, so
+  every new protocol deepened the coupling to it; now `llm` and the
+  transports are siblings over `wire`. `lithe.llm` keeps re-exporting the
+  moved names (`bearer_headers`, `iter_sse_lines`, `extra_body_hint`, …),
+  so existing imports keep working.
+- **refactor: `context_window.py` renamed to `windowing.py`** — two modules
+  named "context*" with unrelated meanings (request context vs context
+  window management) confused every newcomer. The module was never exported
+  from `lithe/__init__` and had a single internal importer (the runtime);
+  its rename is a clean move, no shim left behind. `LLMConfig.context_window`
+  and the `context_window` event fields are untouched — they name the
+  model's token window, not this module.
+- **feat: prompt caching on the Messages transport** — every
+  `MessagesTransport` call now carries `cache_control` breakpoints
+  (`_apply_prompt_cache`): the end of `system` (covering the
+  tools→system prefix; the last tool when there is no system) plus the
+  tail blocks of the last two turns, the rolling agent-loop pattern the
+  protocol documents. The kernel's ReAct step loop re-sends the whole
+  conversation on every model call, so without breakpoints each of up to
+  35 steps re-pays full input price; with them, step N+1 reads step N's
+  cached prefix at 0.1× and pays full price only for the assistant turn
+  and tool results it added (a cache write costs 1.25×, amortized to
+  once per step). Marked blocks are rebuilt as new dicts — pass-through
+  tool dicts and replayed thinking blocks stay byte-stable, which prefix
+  matching requires anyway. A gateway 400 that clears after dropping the
+  breakpoints disables them for the transport instance
+  (`_cache_control`, mirroring the Responses `_include_reasoning`
+  pattern) — availability over economy, one gateway's rejection must not
+  flip behavior for other endpoints in the process.
+- **fix: chat-completions reasoning never reached the display** —
+  `ChatCompletionsTransport._to_result` lifted only content / tool_calls /
+  usage / finish_reason, so DeepSeek/GLM-style `reasoning_content` (and
+  inline `<think>` blocks) were dropped on the floor and the runtime never
+  emitted REASONING events on the chat protocol — hosts showed no thinking
+  process even though the deepseek preset's notes promised display-layer
+  use. The transport now captures both flavors as display-only
+  `{"type": "reasoning", "thinking": text}` items (streamed
+  `reasoning_content` deltas reassemble onto the message in
+  `iter_chat_completion`, OpenRouter's `reasoning` string delta included);
+  `<think>` leakage moves out of the answer text into the reasoning items.
+  Per the per-turn-state contract, none of it goes back on the wire:
+  `_chat_outbound` strips `reasoning` / `reasoning_content` from outgoing
+  assistant messages (DeepSeek forbids pass-back; strict gateways 400 on
+  the unknown field).
+- **encrypted-only reasoning gets an honest marker** — GPT-6-style relays
+  stream `reasoning_details` items whose chain is encrypted
+  (`reasoning.encrypted`, no summary): nothing readable exists to display,
+  so the reasoning digest now says so (「模型思考 N 段；本端点仅返回加密
+  推理，无可显示内容」) instead of rendering nothing — the user sees that
+  thinking happened rather than concluding the feature is broken.
+
 ## 0.1.9 (2026-10-10)
 
 The third-protocol round: Anthropic Messages joins chat-completions and

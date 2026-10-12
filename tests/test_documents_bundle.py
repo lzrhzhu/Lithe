@@ -118,7 +118,10 @@ def _fake_chat(calls: list):
 
 
 def _registry_with_documents(ws, monkeypatch, calls, fmt, **kw):
-    monkeypatch.setattr(documents_mod, "chat_completion", _fake_chat(calls))
+    # the bundle calls the chat client through ChatCompletionsTransport,
+    # which resolves it from its home module — patch it there
+    monkeypatch.setattr("lithe.transports.openai_chat.chat_completion",
+                        _fake_chat(calls))
     reg = ToolRegistry()
     register_document_tools(reg, lambda ctx: ws, llm_config=LLMConfig(
         model="doc-model", base_url="http://relay.test/v1",
@@ -193,7 +196,8 @@ async def test_analyze_document_400_hints_dialect(tmp_path, monkeypatch):
         raise httpx.HTTPStatusError("400 Bad Request",
                                     request=req, response=httpx.Response(400))
 
-    monkeypatch.setattr(documents_mod, "chat_completion", rejecting)
+    monkeypatch.setattr("lithe.transports.openai_chat.chat_completion",
+                        rejecting)
     reg = ToolRegistry()
     register_document_tools(reg, lambda ctx: ws, llm_config=LLMConfig(
         model="m", base_url="http://relay.test/v1", api_key="k"),

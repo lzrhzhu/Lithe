@@ -624,3 +624,52 @@ async def test_patch_applies_across_blank_line(tmp_path):
                              AgentContext(run_id="r", user_id="u"))
     assert res.ok, res.content
     assert ws.read("a.py") == "def f():\n    return 1\n\n\ndef g():\n    return 3\n"
+
+
+# --------------------------------------------------------------------------- #
+# patch: EOF anchoring / insertion order
+# --------------------------------------------------------------------------- #
+
+def _patch_reg(tmp_path):
+    from lithe.bundles.patch import register_apply_patch_tool
+    from lithe.bundles.workspace import Workspace
+    ws = Workspace(tmp_path)
+    reg = ToolRegistry()
+    register_apply_patch_tool(reg, lambda ctx: ws)
+    return ws, reg
+
+
+async def test_eof_chunk_tail_ladder_beats_forward_exact(tmp_path):
+    """尾部仅差空白时，EOF chunk 必须锚定到文件尾，而不是前向精确命中
+    更早的相似行。"""
+    ws, reg = _patch_reg(tmp_path)
+    ws.write("f.txt", "dupe\nmiddle\ndupe \n")  # 尾行多一个行尾空格
+    res = await reg.dispatch("apply_patch", {"patch_text":
+        "*** Begin Patch\n"
+        "*** Update File: f.txt\n"
+        "@@\n"
+        "-dupe\n"
+        "+REPLACED\n"
+        "*** End of File\n"
+        "*** End Patch\n"}, _ctx())
+    assert res.ok, res.content
+    out = ws.read("f.txt")
+    assert out.startswith("dupe\nmiddle\n"), "前部的 dupe 不得被改"
+    assert "REPLACED" in out
+
+
+async def test_two_pure_insertions_keep_document_order(tmp_path):
+    ws, reg = _patch_reg(tmp_path)
+    ws.write("f.txt", "base\n")
+    res = await reg.dispatch("apply_patch", {"patch_text":
+        "*** Begin Patch\n"
+        "*** Update File: f.txt\n"
+        "@@\n"
+        "+first-append\n"
+        "@@\n"
+        "+second-append\n"
+        "*** End Patch\n"}, _ctx())
+    assert res.ok, res.content
+    out = ws.read("f.txt")
+    assert out.index("first-append") < out.index("second-append"), \
+        "同节两个纯插入 chunk 不得颠倒顺序"

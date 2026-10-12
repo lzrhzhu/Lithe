@@ -14,6 +14,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -323,3 +324,97 @@ async def test_concurrent_revive_spawns_exactly_one_process(tmp_path):
         assert mgr.status()["fake"]["pid"] == int(new_pids.pop())
     finally:
         await mgr.close()
+
+
+# --------------------------------------------------------------------------- #
+# MCP
+# --------------------------------------------------------------------------- #
+
+class _PageSession:
+    def __init__(self, pages):
+        self._pages = list(pages)
+        self.calls = []
+
+    async def call(self, method, params=None, *, timeout=None):
+        self.calls.append((method, params))
+        return self._pages.pop(0)
+
+
+async def test_tools_list_pagination_followed():
+    from lithe.bundles.mcp import _list_all_tools
+    session = _PageSession([
+        {"tools": [{"name": "a"}], "nextCursor": "p2"},
+        {"tools": [{"name": "b"}], "nextCursor": "p3"},
+        {"tools": [{"name": "c"}]},
+    ])
+    tools = await _list_all_tools(session, page_timeout=1.0)
+    assert [t["name"] for t in tools] == ["a", "b", "c"]
+    assert session.calls[1] == ("tools/list", {"cursor": "p2"})
+    assert session.calls[2] == ("tools/list", {"cursor": "p3"})
+
+
+def test_stdio_spawn_env_allowlist(monkeypatch):
+    from lithe.bundles.mcp import MCPServerConfig, _StdioSession
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("AUTH_SECRET", "hunter2")
+    monkeypatch.setenv("MY_API_KEY", "sk-leak")
+    cfg = MCPServerConfig(name="s", command=["x"],
+                          env={"TOOL_KEY": "tv"})
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    for key, value in {
+        "SYSTEMROOT": r"C:\Windows",
+        "WINDIR": r"C:\Windows",
+        "TEMP": r"C:\Temp",
+        "COMSPEC": r"C:\Windows\System32\cmd.exe",
+    }.items():
+        monkeypatch.setenv(key, value)
+    env = _StdioSession(cfg)._spawn_env(windows=True)
+    assert env["PATH"] == "/usr/bin" and env["TOOL_KEY"] == "tv"
+    assert env["SYSTEMROOT"] == r"C:\Windows"
+    assert env["WINDIR"] == r"C:\Windows"
+    assert "AUTH_SECRET" not in env and "MY_API_KEY" not in env
+
+    legacy = _StdioSession(
+        MCPServerConfig(name="s", command=["x"], inherit_env=True)
+    )._spawn_env()
+    assert legacy.get("AUTH_SECRET") == "hunter2", "显式 True 保留旧行为"
+
+    closed = _StdioSession(
+        MCPServerConfig(name="s", command=["x"], inherit_env=False)
+    )._spawn_env(windows=True)
+    assert closed.get("TOOL_KEY") is None
+    assert set(closed).issubset({
+        "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE",
+        "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "OS", "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+    })
+
+
+def test_log_host_strips_credentials():
+    from lithe.bundles.mcp import _log_host
+    assert _log_host("https://user:pass@evil.example/api?k=secret") == \
+        "https://evil.example"
+    assert _log_host("https://plain.example/api") == "https://plain.example"
+    assert _log_host(None) == "?"
+
+
+def test_parse_servers_error_does_not_embed_value():
+    from lithe.bundles.mcp import parse_servers
+    with pytest.raises(ValueError) as ei:
+        parse_servers(json.dumps({"bad": "https://k@host/?key=SECRET"}))
+    assert "SECRET" not in str(ei.value)
+
+
+async def test_stdio_read_loop_ignores_non_object_json():
+    """stdout 出现 JSON 数组/标量行不得杀死会话（reader 不得 AttributeError）。"""
+    from lithe.bundles.mcp import MCPServerConfig, _StdioSession
+    session = _StdioSession(MCPServerConfig(name="s", command=["x"]))
+    reader = asyncio.StreamReader()
+    reader.feed_data(b'[1,2]\n"hello"\n42\n')
+    reader.feed_data(b'{"jsonrpc":"2.0","id":7,"result":{"ok":true}}\n')
+    reader.feed_eof()
+    fut = asyncio.get_running_loop().create_future()
+    session._pending[7] = fut
+    session.proc = SimpleNamespace(stdout=reader, stdin=None)
+    await session._read_loop()
+    assert fut.done() and fut.result()["result"] == {"ok": True}

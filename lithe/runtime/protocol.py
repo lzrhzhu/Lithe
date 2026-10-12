@@ -1,5 +1,9 @@
-"""Small protocol and control helpers used by the ReAct runtime."""
+"""Small protocol and control helpers used by the ReAct runtime loop.
 
+Everything here is loop machinery that is not the loop itself: tool-call
+argument parsing, the cancellation-handle adapter, the steering-inbox
+drain, and assistant-message normalization (stable tool-call ids).
+"""
 from __future__ import annotations
 
 import asyncio

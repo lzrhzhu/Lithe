@@ -8,8 +8,10 @@ All VLM calls are faked; no network."""
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 
-import lithe.bundles.images as images_mod
+import pytest
+
 from lithe import AgentContext, LLMConfig, ToolRegistry
 from lithe.bundles.images import probe_image, register_image_tools
 from lithe.bundles.workspace import Workspace
@@ -128,7 +130,10 @@ def _fake_chat(calls: list):
 
 
 def _registry_with_vision(ws, monkeypatch, calls, **kw):
-    monkeypatch.setattr(images_mod, "chat_completion", _fake_chat(calls))
+    # the bundle calls the chat client through ChatCompletionsTransport,
+    # which resolves it from its home module — patch it there
+    monkeypatch.setattr("lithe.transports.openai_chat.chat_completion",
+                        _fake_chat(calls))
     reg = ToolRegistry()
     register_image_tools(reg, lambda ctx: ws, llm_config=LLMConfig(
         model="vision-model", base_url="http://vlm.test/v1",
@@ -200,3 +205,77 @@ async def test_no_llm_config_registers_info_only(tmp_path):
     assert "analyze_image" not in reg.names()
     res = await reg.dispatch("analyze_image", {"path": "x"}, _ctx())
     assert not res.ok  # unknown tool
+
+
+# --------------------------------------------------------------------------- #
+# images
+# --------------------------------------------------------------------------- #
+
+_PNG_MIN = (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" +
+            (4).to_bytes(4, "big") + (3).to_bytes(4, "big") +
+            b"\x08\x06\x00\x00\x00")
+
+
+async def test_analyze_image_detail_auto_shares_cache_key(tmp_path,
+                                                           monkeypatch):
+    from lithe.bundles.images import register_image_tools
+    from lithe.bundles.workspace import Workspace
+    ws = Workspace(tmp_path)
+    ws.write_bytes("img.png", _PNG_MIN)
+    reg = ToolRegistry()
+    register_image_tools(
+        reg, lambda ctx: ws,
+        llm_config=LLMConfig(model="m", base_url="x", api_key="k"))
+    calls = {"n": 0}
+
+    async def fake_completion(client, **kw):
+        calls["n"] += 1
+        return {"choices": [{"message": {"content": "看到一张图"}}]}
+
+    # the bundle now calls the chat client through ChatCompletionsTransport,
+    # which resolves it from its home module — patch it there
+    monkeypatch.setattr("lithe.transports.openai_chat.chat_completion",
+                        fake_completion)
+    r1 = await reg.dispatch("analyze_image",
+                            {"path": "img.png", "question": "是什么",
+                             "detail": "auto"}, _ctx())
+    r2 = await reg.dispatch("analyze_image",
+                            {"path": "img.png", "question": "是什么"}, _ctx())
+    assert r1.ok and r2.ok
+    assert calls["n"] == 1, "detail=auto 与缺省是同一缓存键，不得重复付费"
+
+
+async def test_image_info_probe_window_bounded(tmp_path):
+    from lithe.bundles.images import _PROBE_WINDOW, register_image_tools
+    from lithe.bundles.workspace import Workspace
+    ws = Workspace(tmp_path)
+    ws.write_bytes("big.png", _PNG_MIN + b"\x00" * (_PROBE_WINDOW + 65536))
+    reg = ToolRegistry()
+    register_image_tools(reg, lambda ctx: ws)
+    res = await reg.dispatch("image_info", {"path": "big.png"}, _ctx())
+    assert res.ok
+    assert "PNG" in res.content and "4×3" in res.content
+
+
+async def test_analyze_image_oversize_refused_by_stat(tmp_path):
+    from lithe.bundles.images import register_image_tools
+    from lithe.bundles.workspace import Workspace
+    ws = Workspace(tmp_path)
+    ws.write_bytes("huge.png", _PNG_MIN + b"\x00" * 1024)  # 先写小文件
+    reg = ToolRegistry()
+    read_bytes_calls = {"n": 0}
+    orig_read = Path.read_bytes
+
+    def counting_read(self):
+        read_bytes_calls["n"] += 1
+        return orig_read(self)
+
+    register_image_tools(
+        reg, lambda ctx: ws, max_image_bytes=8,
+        llm_config=LLMConfig(model="m", base_url="x", api_key="k"))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Path, "read_bytes", counting_read)
+        res = await reg.dispatch("analyze_image",
+                                 {"path": "huge.png", "question": "?"}, _ctx())
+    assert not res.ok and "超过上限" in res.content
+    assert read_bytes_calls["n"] == 0, "超限应先 stat 拒绝，不整读文件"

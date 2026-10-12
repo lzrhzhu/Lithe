@@ -26,6 +26,7 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import cast
 
 from lithe.bundles.store.protocol import (
     StoredAction, StoredMessage, StoredRun,
@@ -155,7 +156,7 @@ class JsonlRunStore:
             row["error"] = error
         self._append(self._runs, row)
 
-    def _fold_runs(self, user_id):
+    def _fold_runs(self, user_id) -> tuple[dict[str, StoredRun], list[str]]:
         """Return ``(by_id, order)`` of StoredRun for *user_id*, newest state wins.
 
         ``run_final`` lines carry no ``user_id``; they are only applied to runs
@@ -166,7 +167,7 @@ class JsonlRunStore:
         order: list[str] = []
         for ln in self._read(self._runs):
             kind = ln.get("kind")
-            rid = ln.get("run_id")
+            rid = cast("str", ln.get("run_id"))
             if kind == "run":
                 if ln.get("user_id") != user_id:
                     continue
@@ -214,7 +215,7 @@ class JsonlRunStore:
                                       "tool_call_id": msg.tool_call_id,
                                       "meta": msg.meta, "subagent": msg.subagent})
 
-    def _msg_rows(self, run_ids, user_id, *, exclude_subagent):
+    def _msg_rows(self, run_ids, user_id, *, exclude_subagent) -> list[dict]:
         rids = set(run_ids)
         out = []
         for ln in self._read(self._messages):
@@ -255,7 +256,9 @@ class JsonlRunStore:
         return v
 
     # -- actions --------------------------------------------------------------
-    def _fold_actions(self, *, subagent: str | None = None):
+    def _fold_actions(
+            self, *, subagent: str | None = None
+    ) -> tuple[dict[int, StoredAction], list[int]]:
         """Return ``(by_id, order)``; latest ``action_status`` wins per id.
 
         With ``subagent`` set, only that subagent's action rows are folded
@@ -266,9 +269,10 @@ class JsonlRunStore:
             if ln.get("kind") == "action":
                 if subagent is not None and ln.get("subagent") != subagent:
                     continue
-                aid = ln.get("id")
+                aid = cast("int", ln.get("id"))
                 by_id[aid] = StoredAction(
-                    run_id=ln.get("run_id"), user_id=ln.get("user_id"),
+                    run_id=cast("str", ln.get("run_id")),
+                    user_id=cast("str", ln.get("user_id")),
                     kind=ln.get("mkind", ""), target=ln.get("target", ""),
                     old_value=self._unspill_value(ln.get("old_value")),
                     new_value=self._unspill_value(ln.get("new_value")),
@@ -337,13 +341,13 @@ class JsonlRunStore:
         return a
 
     # -- conversations --------------------------------------------------------
-    def _fold_conversations(self, user_id):
+    def _fold_conversations(self, user_id) -> list[dict]:
         by_id: dict[int, dict] = {}
         order: list[int] = []
         deleted: set[int] = set()
         for ln in self._read(self._conversations):
             k = ln.get("kind")
-            cid = ln.get("id")
+            cid = cast("int", ln.get("id"))
             if k == "rename":
                 if cid in by_id:
                     by_id[cid]["title"] = ln.get("title", by_id[cid].get("title"))

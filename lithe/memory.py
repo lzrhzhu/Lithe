@@ -15,7 +15,7 @@ None of these read storage; they only reshape data the host hands them.
 from __future__ import annotations
 
 import json
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from collections.abc import Callable
 
 from lithe.context import AgentContext
@@ -54,7 +54,7 @@ def recap_text(older_runs: list[dict], acts_by_run: dict[str, list[str]]) -> str
         ans = (r.get("final") or "").strip()
         if not ans and r.get("status") == "failed":
             ans = "（该轮出错未完成）"
-        labels = [lb for lb in acts_by_run.get(r.get("run_id"), []) if lb]
+        labels = [lb for lb in acts_by_run.get(r.get("run_id") or "", []) if lb]
         parts = [f"用户问：{task}"]
         if ans:
             parts.append(f"回复摘要：{ans[:300]}")
@@ -347,7 +347,7 @@ def run_timeline(run: dict, messages: list[dict], actions: list[dict], *,
             events.append(tr)
             cat = tool_category.get(m.get("tool_name") or "")
             if has_meta_ui:
-                events.extend(meta_ui)
+                events.extend(cast("list", meta_ui))
                 if cat and queues.get(cat):
                     queues[cat].pop(0)
             elif cat and ok is not False and queues.get(cat):

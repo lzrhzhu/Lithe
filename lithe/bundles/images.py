@@ -15,11 +15,12 @@ Two tools, per the "perception stays in tools" design:
 
 This is deliberately NOT a subagent: a full ReAct runtime (tools, system
 prompt, step loop) is overkill for one look-at-image-answer-question call —
-a single :func:`lithe.llm.chat_completion` round-trip is the whole story.
-The model used is whatever ``llm_config`` the host passes at registration:
-the same ``LLMConfig`` as the main loop reuses the main model; a dedicated
-one routes vision to a different endpoint; omitting it registers only the
-deterministic ``image_info``.
+a single :meth:`ChatCompletionsTransport.complete
+<lithe.transports.openai_chat.ChatCompletionsTransport.complete>` round-trip
+is the whole story. The model used is whatever ``llm_config`` the host
+passes at registration: the same ``LLMConfig`` as the main loop reuses the
+main model; a dedicated one routes vision to a different endpoint; omitting
+it registers only the deterministic ``image_info``.
 
 Optional bundle — stdlib + httpx only (like the rest of lithe); Pillow is
 NOT required. Headers are parsed, pixels never decoded, so a crafted file
@@ -39,10 +40,15 @@ from pathlib import Path
 import httpx
 
 from lithe.context import AgentContext
-from lithe.llm import chat_completion, first_content, strip_think
 from lithe.runtime import LLMConfig
 from lithe.tools import ToolCategory, ToolRegistry, ToolResult, ToolSpec
+from lithe.transports import ChatCompletionsTransport
+from lithe.transports.openai_chat import strip_think
 from lithe.bundles.workspace import Workspace
+
+# One shared instance for the bundle's one-shot perception calls; stateless
+# for non-streaming complete(), and the bundles never stream.
+_TRANSPORT = ChatCompletionsTransport()
 
 DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024
 DEFAULT_CACHE_SIZE = 64
@@ -238,6 +244,7 @@ def register_image_tools(
         err, target = _resolve(workspace_for(ctx), rel)
         if err is not None:
             return err
+        assert target is not None  # err is None ⇔ target resolved
         # Read a bounded header window off the event loop: headers (magic,
         # dimensions, dpi chunks) sit at the front, so a huge file probes in
         # constant memory instead of an unbounded read_bytes on the loop.
@@ -302,6 +309,7 @@ def register_image_tools(
         err, target = _resolve(workspace_for(ctx), rel)
         if err is not None:
             return err
+        assert target is not None  # err is None ⇔ target resolved
         # Size check BEFORE reading: a 2GB upload must be refused by stat,
         # not by loading 2GB into memory first.
         size = (await asyncio.to_thread(target.stat)).st_size
@@ -332,17 +340,17 @@ def register_image_tools(
         ]}]
         try:
             async with httpx.AsyncClient(timeout=cfg.timeout) as client:
-                resp = await chat_completion(
+                result = await _TRANSPORT.complete(
                     client, base_url=cfg.base_url, api_key=cfg.api_key,
                     model=cfg.model, messages=messages,
                     attempts=cfg.attempts, sleep_429=cfg.sleep_429,
-                    sleep_err=cfg.sleep_err, log_name="analyze-image")
+                    sleep_err=cfg.sleep_err)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(
                 False, "模型请求失败",
                 f"图像分析请求失败：{exc}。可稍后重试，或先用 image_info "
                 f"查看确定元信息。")
-        answer = strip_think(first_content(resp))
+        answer = strip_think(result.get("content") or "")
         if not answer:
             return ToolResult(False, "空回复",
                               "图像模型未返回内容，请稍后重试或换一个问题。")

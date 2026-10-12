@@ -40,6 +40,11 @@ _MARK = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]",
 _MAX_CONTENT = 256
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
+# Annotation alias: TodoStore defines a method named ``list``, which shadows
+# the builtin inside the class body's annotations — the alias keeps them
+# resolvable without renaming the public API.
+_ItemList = list[dict]
+
 
 def _clean_content(content: str) -> str:
     """Collapse control chars/internal whitespace and cap length.
@@ -113,16 +118,16 @@ class TodoStore:
     :meth:`_save` to persist (see :class:`JsonTodoStore`).
     """
 
-    def __init__(self, items: list[dict] | None = None, *, max_todos: int = 20):
+    def __init__(self, items: _ItemList | None = None, *, max_todos: int = 20):
         if not isinstance(max_todos, int) or isinstance(max_todos, bool) or max_todos < 1:
             raise ValueError("max_todos 必须是正整数")
         self.max_todos = max_todos
         self._items = _sanitize_loaded(items or [])[:self.max_todos]
 
-    def list(self) -> list[dict]:
+    def list(self) -> _ItemList:
         return [dict(i) for i in self._items]
 
-    def replace(self, items: list[dict]) -> tuple[list[dict], list[dict]]:
+    def replace(self, items: _ItemList) -> tuple[_ItemList, _ItemList]:
         if not isinstance(items, list):
             raise ValueError("todos 必须是数组")
         if len(items) > self.max_todos:
@@ -135,7 +140,7 @@ class TodoStore:
         self._save()
         return old, self.list()
 
-    def restore(self, old: list[dict]) -> None:
+    def restore(self, old: _ItemList) -> None:
         self._items = _sanitize_loaded(old or [])[:self.max_todos]
         self._save()
 
@@ -148,7 +153,7 @@ class TodoStore:
         """
         if not self._items:
             return "（任务清单为空）"
-        lines = [f"{i}. {_MARK.get(it.get('status'), '[ ]')}"
+        lines = [f"{i}. {_MARK.get(it['status'], '[ ]')}"
                  f" {it.get('content', '')}"
                  for i, it in enumerate(self._items, 1)]
         done = sum(1 for it in self._items if it.get("status") == "completed")

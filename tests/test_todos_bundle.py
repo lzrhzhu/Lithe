@@ -3,6 +3,8 @@ todo_change UI contract, JSON persistence and an undo reverter — pinned with
 no host application and no DB."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from lithe import Action, AgentContext, ToolRegistry, UndoEngine
@@ -255,3 +257,35 @@ def test_update_todos_description_discourages_trivial_plans():
     assert "固定数量" in update_spec["description"]
     assert "完整" in update_spec["parameters"]["properties"]["todos"]["description"]
     assert "显示当前任务清单" in reg.spec("list_todos").to_openai()["function"]["description"]
+
+
+# --------------------------------------------------------------------------- #
+# todos
+# --------------------------------------------------------------------------- #
+
+def test_json_todo_store_drops_malformed_items(tmp_path):
+    from lithe.bundles import JsonTodoStore
+    p = tmp_path / "todos.json"
+    p.write_text(json.dumps({"items": [
+        {"id": "i1", "content": "ok", "status": "pending",
+         "priority": "medium"},
+        {"content": "bad status", "status": "bogus"},
+        "not-a-dict",
+        {"content": "", "status": "pending"},
+    ]}), encoding="utf-8")
+    store = JsonTodoStore(p)
+    items = store.list()
+    assert len(items) == 1 and items[0]["content"] == "ok"
+    block = store.to_block()  # 不得抛异常（它渲染进每次 run 的系统提示词）
+    assert "ok" in block
+
+
+def test_json_todo_store_save_is_atomic_no_tmp_left(tmp_path):
+    from lithe.bundles import JsonTodoStore
+    p = tmp_path / "todos.json"
+    store = JsonTodoStore(p)
+    store.replace([{"content": "a", "status": "pending"}])
+    store.replace([{"content": "b", "status": "in_progress"}])
+    assert not list(tmp_path.glob("*.tmp"))
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["items"][0]["content"] == "b"

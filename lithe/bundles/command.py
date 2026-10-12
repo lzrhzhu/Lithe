@@ -370,8 +370,13 @@ async def _stop_process(proc: asyncio.subprocess.Process) -> None:
             except ProcessLookupError:
                 pass
         return
+    # POSIX-only APIs (Windows returns above); resolved dynamically so this
+    # module type-checks on a Windows typeshed.
+    killpg = getattr(os, "killpg", None)
+    sigkill = getattr(signal, "SIGKILL", None)
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        if killpg is not None and sigkill is not None:
+            killpg(proc.pid, sigkill)
     except (ProcessLookupError, PermissionError, OSError):
         if proc.returncode is None:
             try:
@@ -430,22 +435,29 @@ class CommandRunner:
                                "通过后才会到达这里。"),
                     "exit_code": -1, "duration": 0.0, "timed_out": False}
         cwd = os.fspath(cwd_path)
-        kwargs = {}
-        if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        else:
-            kwargs["start_new_session"] = True
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         started = time.monotonic()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=cwd,
-                env=_command_env(self.extra_env),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **kwargs,
-            )
+            if os.name == "nt":
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=cwd,
+                    env=_command_env(self.extra_env),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=creationflags,
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=cwd,
+                    env=_command_env(self.extra_env),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                )
         except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
             return {"stdout": "", "stderr": f"命令启动失败：{exc}", "exit_code": -1,
                     "duration": round(time.monotonic() - started, 3), "timed_out": False}

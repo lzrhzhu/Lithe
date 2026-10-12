@@ -626,3 +626,88 @@ def test_blob_load_rejects_forged_refs(tmp_path):
     rows = s.list_actions("r1", "u1")
     assert rows[0].old_value == forged
     assert "HOST SECRET" not in str(rows[0].old_value)
+
+
+# --------------------------------------------------------------------------- #
+# store: subagent filter / torn lines / undo mark failures
+# --------------------------------------------------------------------------- #
+
+def _store_with_actions(tmp_path):
+    from lithe.bundles import JsonlRunStore
+    store = JsonlRunStore(tmp_path)
+    store.log_action("r", "u", "file_write", "a", None, "1", subagent="w1")
+    store.log_action("r", "u", "file_write", "b", None, "2", subagent="w2")
+    store.log_action("r", "u", "file_write", "c", None, "3")  # 编排者自身
+    return store
+
+
+def test_list_actions_subagent_filter(tmp_path):
+    store = _store_with_actions(tmp_path)
+    w1 = store.list_actions("r", "u", subagent="w1")
+    assert [a.target for a in w1] == ["a"]
+    allr = store.list_actions("r", "u")
+    assert [a.target for a in allr] == ["a", "b", "c"]
+
+
+def test_list_actions_subagent_filter_skips_blob_rehydrate(tmp_path,
+                                                            monkeypatch):
+    from lithe.bundles import JsonlRunStore
+    store = JsonlRunStore(tmp_path)
+    big = "v" * (store.spill_threshold + 100)
+    store.log_action("r", "u", "k", "a", big, big, subagent="w1")
+    store.log_action("r", "u", "k", "b", big, big, subagent="w2")
+    unspills = {"n": 0}
+    orig = JsonlRunStore._unspill_value
+
+    def counting(self, v):
+        if isinstance(v, str) and v.startswith("blob:"):
+            unspills["n"] += 1
+        return orig(self, v)
+
+    monkeypatch.setattr(JsonlRunStore, "_unspill_value", counting)
+    w2 = store.list_actions("r", "u", subagent="w2")
+    assert [a.target for a in w2] == ["b"]
+    assert unspills["n"] == 2, "只 rehydrate 被选中行的 old/new"
+
+
+def test_torn_lines_counted_and_logged(tmp_path, caplog):
+    store = _store_with_actions(tmp_path)
+    with (tmp_path / "actions.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write('{"kind": "action", "id": 99, "broken')  # 撕裂行
+    with caplog.at_level("WARNING"):
+        acts = store.list_actions("r", "u")
+    assert [a.target for a in acts] == ["a", "b", "c"]
+    assert store.dropped_lines.get(tmp_path / "actions.jsonl") == 1
+    assert any("dropped 1" in r.message for r in caplog.records)
+
+
+async def test_undo_run_reports_status_mark_failure(tmp_path):
+    from lithe.bundles import AgentHost, JsonlRunStore
+    from lithe.bundles.host import undo_run
+
+    class _FailingMark(JsonlRunStore):
+        def set_action_status(self, action_id, user_id, status):
+            raise OSError("disk full")
+
+    store = _FailingMark(tmp_path)
+    store.create_run("r", "u", "t")
+    store.log_action("r", "u", "k", "target", "old", "new")
+    reg = ToolRegistry()
+    host = AgentHost(reg, LLMConfig(model="m", base_url="x", api_key="k"),
+                     store)
+    calls = {"n": 0}
+
+    def revert(action, ctx):
+        calls["n"] += 1
+
+    report = await undo_run(host, "r", "u", reverters={"k": revert})
+    assert calls["n"] == 1, "reverter 本身执行成功"
+    assert not report.ok
+    assert report.errors and "标记撤销状态失败" in report.errors[0]
+
+
+def test_store_fsync_option_roundtrip(tmp_path):
+    from lithe.bundles import JsonlRunStore
+    store = JsonlRunStore(tmp_path, fsync=True)
+    store.create_run("r", "u", "t")
+    assert store.get_run("r", "u").task == "t"

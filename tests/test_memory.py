@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 
-from lithe import recap_text, replay_messages, truncate_tool_result
+from lithe import recap_text, replay_messages, run_timeline, truncate_tool_result
 
 
 # --- truncate_tool_result ---
@@ -162,3 +162,42 @@ def test_replay_accepts_parsed_tool_calls_list():
     ]
     out = replay_messages(rows)
     assert out[0]["tool_calls"][0]["id"] == "c1"
+
+
+# --------------------------------------------------------------------------- #
+# memory: window-start orphans / timeline ok=unknown
+# --------------------------------------------------------------------------- #
+
+def test_replay_window_starting_at_tool_row_drops_orphan():
+    rows = [
+        {"role": "tool", "tool_call_id": "c-old", "content": "stale"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1",
+                         "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "fresh"},
+    ]
+    out = replay_messages(rows)
+    assert out[0]["role"] == "assistant", "首消息不得是孤儿 tool 行"
+    assert all(m.get("tool_call_id") != "c-old" for m in out)
+
+
+def test_replay_legacy_positional_pairing_still_works():
+    rows = [
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1",
+                         "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "content": "r1"},  # 无 id，按位置配对
+    ]
+    out = replay_messages(rows)
+    assert out[1]["tool_call_id"] == "c1"
+
+
+def test_run_timeline_missing_meta_reports_ok_unknown():
+    msgs = [{"role": "tool", "content": "工具调用失败：x", "tool_name": "t",
+             "tool_call_id": "c1"}]
+    events = run_timeline({}, msgs, [],
+                          tool_category={"t": "file"},
+                          action_category=lambda a: None,
+                          action_events_fn=lambda a: [])
+    tr = events[0]
+    assert tr["ok"] is None, "缺 meta 时 ok 未知，而不是嗅探错误前缀"

@@ -28,7 +28,7 @@ classifiers = [
 # placeholder links to a non-existent github org mislead more than they help.
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4", "mypy>=1.8"]
 
 [tool.setuptools.dynamic]
 # Single source of truth: the literal in lithe/__init__.py (setuptools
@@ -46,6 +46,18 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "B", "UP", "ASYNC"]
+
+[tool.mypy]
+# Start on the kernel package; strictness ratchets up over time. The tests
+# and scripts stay unchecked for now (they intentionally lean on duck-typed
+# fakes and tmp_path plumbing).
+files = ["lithe"]
+python_version = "3.10"
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
